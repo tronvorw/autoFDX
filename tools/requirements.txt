@@ -8,19 +8,14 @@ opencv-python>=4.9.0
 # pyautogui 及其全部子依赖（显式声明，避免传递依赖拉取失败）
 #   pyautogui -> pyscreeze  -> Pillow（截图）
 #             -> pymsgbox         （弹窗）
-#             -> pytweening       （缓动）
-#             -> mouseinfo        （鼠标信息；常配合 pyperclip）
-#   Windows 下 pyautogui / mouseinfo 常间接依赖窗口枚举相关包，一并显式写出：
-#             -> pygetwindow -> pyrect
+#             -> pytweening        （缓动）
+#             -> mouseinfo         （鼠标信息）
 # ──────────────────────────────────────────────
 Pillow>=10.3.0
 pyscreeze>=0.1.30
 pymsgbox>=1.0.9
 pytweening>=1.2.0
 mouseinfo>=0.1.3
-pyperclip>=1.8.0
-pyrect>=0.2.0
-pygetwindow>=0.0.5
 pyautogui>=0.9.54
 
 # ──────────────────────────────────────────────

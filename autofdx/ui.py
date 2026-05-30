@@ -1,5 +1,10 @@
+import os
+import threading
 import tkinter as tk
+import webbrowser
 from tkinter import font as tkfont
+from tkinter import messagebox
+from tkinter import scrolledtext
 from tkinter import ttk
 import ctypes
 from pathlib import Path
@@ -9,8 +14,15 @@ import cv2
 import numpy as np
 import pyautogui
 
+from .config import APP_VERSION
 from .config import CALIBRATION_ITEMS
 from .config import PROJECT_ROOT
+from .config import UPDATE_CHECK_GITHUB_REPO
+from .self_update import prepare_tag_source_folder
+from .self_update import spawn_post_exit_apply
+from .update_check import fetch_latest_update_candidate
+from .update_check import github_tree_url_for_tag
+from .update_check import is_remote_newer
 from .vision_service import like_pool_annulus_radii, sample_hsv_profile
 
 BG_APP = "#0f172a"
@@ -773,12 +785,12 @@ class CalibrationOverlay:
                     )
 
     def save(self):
+        self.clamp()
         x1, y1, x2, y2 = self.rect
         norm = [x1 / self.game_width, y1 / self.game_height, x2 / self.game_width, y2 / self.game_height]
         if self._is_point_mode_item():
             # 点赞项只保留单点：为了复用既有数据结构，写为零面积矩形 [x,y,x,y]。
             # 后续计算中心点时仍可得到准确点击坐标。
-            self.clamp()
             px, py = self.point
             nx = px / self.game_width
             ny = py / self.game_height
@@ -902,7 +914,7 @@ class CalibrationOverlay:
                 or cur_exp[1] > 4
             ):
                 self.config["current_experiment"] = [1, 1]
-        elif self._is_body_part_item():
+        if self._is_body_part_item():
             part_points = []
             for px, py in self._build_body_part_points():
                 part_points.append([px / self.game_width, py / self.game_height])
@@ -1090,15 +1102,35 @@ def launch_floating_window(config_store, state, window_service):
     # 在当前两列紧凑布局下，整体宽度可适当下调，减少横向占位。
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
-    win_w = min(780, max(620, screen_w - 200))
+    default_win_w = min(780, max(620, screen_w - 200))
+    default_win_h_collapsed = 200
+    min_win_w = 460
+    min_win_h = 180
+    saved_size = config_store.data.get("ui_window_size", [default_win_w, default_win_h_collapsed])
+    if not isinstance(saved_size, list) or len(saved_size) != 2:
+        saved_size = [default_win_w, default_win_h_collapsed]
+    try:
+        win_w = int(saved_size[0])
+        saved_h = int(saved_size[1])
+    except Exception:
+        win_w = default_win_w
+        saved_h = default_win_h_collapsed
+    win_w = max(min_win_w, min(max(screen_w, min_win_w), win_w))
     saved_pos = config_store.data.get("ui_window_pos", [20, 20])
     if not isinstance(saved_pos, list) or len(saved_pos) != 2:
         saved_pos = [20, 20]
     win_x = int(saved_pos[0])
     win_y = int(saved_pos[1])
+    saved_expanded_size = config_store.data.get("ui_window_expanded_size", [win_w, 500])
+    if not isinstance(saved_expanded_size, list) or len(saved_expanded_size) != 2:
+        saved_expanded_size = [win_w, 500]
+    try:
+        saved_expanded_h = int(saved_expanded_size[1])
+    except Exception:
+        saved_expanded_h = 500
     # 状态与控件布局收紧后，折叠态先给保守高度，启动后再按内容收紧（fit_collapsed_height）。
-    win_h_expanded = 500
-    win_h_collapsed = 260
+    win_h_expanded = max(320, saved_expanded_h)
+    win_h_collapsed = max(min_win_h, saved_h)
     # 标定子菜单已展开时，若同时展开「设置」面板，在固定展开高度上追加的像素（避免内容被裁切）。
     win_h_settings_extra = 200
 
@@ -1115,7 +1147,8 @@ def launch_floating_window(config_store, state, window_service):
     # 使用内嵌窗口控制按钮，隐藏系统边框与标题栏。
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.resizable(False, False)
+    root.resizable(True, True)
+    root.minsize(min_win_w, min_win_h)
     root.configure(bg=BG_APP)
     like_chk_style = ttk.Style(root)
     # 优先使用 Windows 主题，按钮外观更接近圆角。
@@ -1160,6 +1193,8 @@ def launch_floating_window(config_store, state, window_service):
     single_cum_mode_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("single_cum_mode_enabled", False)))
     overlay_dx_var = tk.BooleanVar(value=bool(config_store.data.get("overlay_dx_hook_enabled", False)))
     auto_refill_stamina_var = tk.BooleanVar(value=bool(config_store.data.get("auto_refill_stamina_enabled", False)))
+    # True=Beta 通道（含 GitHub 预发布）；False=仅正式版 Release。
+    update_beta_var = tk.BooleanVar(value=(config_store.data.get("update_channel", "release") == "beta"))
     overlay = CalibrationOverlay(root, config_store, state, window_service)
     all_overlay = AllCalibrationOverlay(root, config_store, state, window_service)
     selector_win = None
@@ -1168,14 +1203,41 @@ def launch_floating_window(config_store, state, window_service):
     label_map = {k: t for k, t in CALIBRATION_ITEMS}
     save_pos_after_id = None
     is_pinned_topmost = True
+    # 「检查更新 / 下载更新」防重复点击。
+    update_check_busy = False
     drag_start_x = 0
     drag_start_y = 0
+    resize_start_x = 0
+    resize_start_y = 0
+    resize_start_w = win_w
+    resize_start_h = win_h_collapsed
+    status_text_label = None
+    layout_column_count = 0
     overlay_last_applied = None
 
     def persist_window_pos():
+        nonlocal win_w, win_h_collapsed, win_h_expanded
+        try:
+            if root.winfo_exists() == 0:
+                return
+        except tk.TclError:
+            return
+        width = max(min_win_w, int(root.winfo_width()))
+        height = max(min_win_h, int(win_h_collapsed))
         pos = [int(root.winfo_x()), int(root.winfo_y())]
+        size = [width, height]
+        expanded_size = [width, max(320, int(win_h_expanded))]
+        changed = False
         if config_store.data.get("ui_window_pos") != pos:
             config_store.data["ui_window_pos"] = pos
+            changed = True
+        if config_store.data.get("ui_window_size") != size:
+            config_store.data["ui_window_size"] = size
+            changed = True
+        if config_store.data.get("ui_window_expanded_size") != expanded_size:
+            config_store.data["ui_window_expanded_size"] = expanded_size
+            changed = True
+        if changed:
             config_store.save()
 
     def schedule_persist_window_pos():
@@ -1186,7 +1248,21 @@ def launch_floating_window(config_store, state, window_service):
         save_pos_after_id = root.after(250, persist_window_pos)
 
     def on_root_configure(event):
+        nonlocal win_w
         if event.widget is root:
+            width = int(root.winfo_width())
+            if width >= min_win_w:
+                win_w = width
+            try:
+                if status_text_label is not None:
+                    wrap_px = max(200, int(width - 16 - _right_col_minsize - 24))
+                    status_text_label.configure(wraplength=wrap_px)
+            except Exception:
+                pass
+            try:
+                refresh_responsive_layout(width, int(root.winfo_height()))
+            except NameError:
+                pass
             schedule_persist_window_pos()
 
     def on_title_press(event):
@@ -1204,6 +1280,38 @@ def launch_floating_window(config_store, state, window_service):
         new_y = int(root.winfo_y() + dy)
         root.geometry(f"{win_w}x{root.winfo_height()}+{new_x}+{new_y}")
         on_title_press(event)
+
+    def on_resize_press(event):
+        nonlocal resize_start_x, resize_start_y, resize_start_w, resize_start_h
+        resize_start_x = event.x_root
+        resize_start_y = event.y_root
+        resize_start_w = int(root.winfo_width())
+        resize_start_h = int(root.winfo_height())
+
+    def on_resize_drag(event, resize_width=True, resize_height=True):
+        nonlocal win_w, win_h_collapsed, win_h_expanded
+        dx = event.x_root - resize_start_x
+        dy = event.y_root - resize_start_y
+        new_w = max(min_win_w, resize_start_w + dx) if resize_width else resize_start_w
+        new_h = max(min_win_h, resize_start_h + dy) if resize_height else resize_start_h
+        max_w = max(min_win_w, screen_w - int(root.winfo_x()))
+        max_h = max(min_win_h, screen_h - int(root.winfo_y()))
+        new_w = min(new_w, max_w)
+        new_h = min(new_h, max_h)
+        win_w = int(new_w)
+        try:
+            if submenu_host.winfo_ismapped():
+                win_h_expanded = int(new_h)
+            else:
+                win_h_collapsed = int(new_h)
+        except Exception:
+            win_h_collapsed = int(new_h)
+        root.geometry(f"{int(new_w)}x{int(new_h)}+{int(root.winfo_x())}+{int(root.winfo_y())}")
+        try:
+            refresh_responsive_layout(int(new_w), int(new_h))
+        except NameError:
+            pass
+        schedule_persist_window_pos()
 
     def refresh_pin_button():
         # 固定按钮：控制是否保持置顶固定显示。
@@ -1442,13 +1550,18 @@ def launch_floating_window(config_store, state, window_service):
             return
         settings_extra = win_h_settings_extra if (sub_open and set_open) else 0
         if sub_open:
-            nh = win_h_expanded + settings_extra
+            nh = max(win_h_expanded, 320 + settings_extra)
         else:
             root.update_idletasks()
-            nh = max(200, int(root.winfo_reqheight()))
-            win_h_collapsed = nh
+            nh = max(min_win_h, int(root.winfo_reqheight()), int(win_h_collapsed))
+            if not set_open:
+                win_h_collapsed = nh
         cx, cy = clamp_window_pos(nh, root.winfo_x(), root.winfo_y())
         root.geometry(f"{win_w}x{nh}+{cx}+{cy}")
+        try:
+            refresh_responsive_layout(win_w, nh)
+        except NameError:
+            pass
 
     def toggle_settings():
         """展开/收起「设置」子区域（勾选与全屏兼容等）。"""
@@ -1529,9 +1642,16 @@ def launch_floating_window(config_store, state, window_service):
     ):
         """Canvas 圆角按钮，避免系统主题导致白底与方角。"""
         holder = tk.Frame(parent, bg=parent.cget("bg"))
-        canvas = tk.Canvas(holder, width=width, height=height, bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2")
+        btn_w = int(width)
+        btn_h = int(height)
+        font_obj = tkfont.Font(font=font)
+        canvas = tk.Canvas(holder, width=btn_w, height=btn_h, bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2")
         canvas.pack()
         state = {"text": text, "normal_bg": normal_bg, "hover_bg": hover_bg, "fg": fg, "last_click_ts": 0.0}
+
+        def min_width_for_text(value=None):
+            value = state["text"] if value is None else value
+            return max(34, int(font_obj.measure(str(value))) + 28)
 
         def _rounded_points(w, h, r):
             return [
@@ -1562,21 +1682,32 @@ def launch_floating_window(config_store, state, window_service):
             ]
 
         def redraw(fill):
+            canvas.configure(width=btn_w, height=btn_h)
             canvas.delete("all")
             canvas.create_polygon(
-                _rounded_points(width, height, min(radius, width // 2, height // 2)),
+                _rounded_points(btn_w, btn_h, min(radius, btn_w // 2, btn_h // 2)),
                 smooth=True,
                 splinesteps=36,
                 fill=fill,
                 outline=fill,
             )
-            canvas.create_text(width // 2, height // 2, text=state["text"], fill=state["fg"], font=font)
+            canvas.create_text(btn_w // 2, btn_h // 2, text=state["text"], fill=state["fg"], font=font)
 
         def set_text(new_text):
+            nonlocal btn_w
             # 文案未变化时不重绘，避免 refresh 周期引发视觉抖动。
             if state["text"] == new_text:
                 return
             state["text"] = new_text
+            btn_w = max(btn_w, min_width_for_text())
+            redraw(state["normal_bg"])
+
+        def set_size(new_width=None, new_height=None):
+            nonlocal btn_w, btn_h
+            if new_width is not None:
+                btn_w = max(min_width_for_text(), int(new_width))
+            if new_height is not None:
+                btn_h = max(28, int(new_height))
             redraw(state["normal_bg"])
 
         def set_style(normal_bg=None, hover_bg=None, fg=None):
@@ -1609,6 +1740,9 @@ def launch_floating_window(config_store, state, window_service):
         redraw(state["normal_bg"])
         holder.set_text = set_text
         holder.set_style = set_style
+        holder.set_size = set_size
+        holder.min_width = min_width_for_text
+        holder.current_width = lambda: btn_w
         return holder
 
     def refresh_like_force_state():
@@ -1705,6 +1839,15 @@ def launch_floating_window(config_store, state, window_service):
         else:
             state.set_status("已关闭自动补充体力")
 
+    def on_update_channel_toggle():
+        """持久化更新通道：Release 仅正式版；Beta 包含预发布 Release。"""
+        config_store.data["update_channel"] = "beta" if update_beta_var.get() else "release"
+        config_store.save()
+        if update_beta_var.get():
+            state.set_status("检查更新：已切换到 Beta 通道（含预发布）")
+        else:
+            state.set_status("检查更新：已切换到正式版通道（Release）")
+
     # 不再使用外层加粗描边框（用户反馈过宽）；内容区直接铺满根窗口。
     frame = tk.Frame(root, padx=10, pady=8, bg=BG_APP)
     frame.pack(fill="both", expand=True)
@@ -1724,6 +1867,7 @@ def launch_floating_window(config_store, state, window_service):
         bg=HEADER_BAR_BG,
         font=("Microsoft YaHei UI", 9),
     )
+    # 右侧仅保留固定/关闭；「检查更新」在左侧标题区，避免挤占原按钮位置。
     win_btn_host = tk.Frame(title_row, bg=HEADER_BAR_BG)
     btn_win_pin = create_round_button(
         win_btn_host,
@@ -1748,15 +1892,247 @@ def launch_floating_window(config_store, state, window_service):
         radius=12,
         font=("Microsoft YaHei UI", 11, "bold"),
     )
-    # 先固定右侧控件组，再从左侧 pack，保证标题/提示与按钮在同一行内垂直居中对齐。
+
+    def _start_download_and_apply(tag_name: str, repo: str):
+        """
+        后台下载 zipball 并解压到 .update_staging；确认后拉起 apply_update 子进程并退出主程序。
+        子进程会等待当前 PID 结束后再覆盖文件，从而绕过「运行中无法覆盖自身脚本」的系统限制。
+        """
+        nonlocal update_check_busy
+        if update_check_busy:
+            return
+        update_check_busy = True
+        btn_check_update.set_text("下载中…")
+
+        def dl_worker():
+            inner, err = prepare_tag_source_folder(repo, tag_name, PROJECT_ROOT)
+
+            def after_dl():
+                nonlocal update_check_busy
+                if err:
+                    update_check_busy = False
+                    btn_check_update.set_text("检查更新")
+                    messagebox.showerror("自动更新", err, parent=root)
+                    return
+                msg = (
+                    f"新版本 {tag_name} 已下载完成。\n\n"
+                    "即将关闭本程序，由后台进程替换本地文件并重新启动。\n"
+                    "不会覆盖：data/user_config.json、已存在的 assets/templates/custom_*.png。\n\n"
+                    "是否继续？"
+                )
+                if not messagebox.askokcancel("确认更新", msg, parent=root):
+                    update_check_busy = False
+                    btn_check_update.set_text("检查更新")
+                    return
+                ok, reason = spawn_post_exit_apply(
+                    source_inner=inner,
+                    project_root=PROJECT_ROOT,
+                    wait_pid=os.getpid(),
+                )
+                if not ok:
+                    update_check_busy = False
+                    btn_check_update.set_text("检查更新")
+                    messagebox.showerror("自动更新", reason, parent=root)
+                    return
+                state.set_status("正在退出以应用更新…")
+                root.after(200, on_exit)
+
+            root.after(0, after_dl)
+
+        threading.Thread(target=dl_worker, daemon=True).start()
+
+    def _show_new_version_dialog(repo: str, cur_ver: str, cand: dict):
+        """
+        展示 GitHub Release 更新说明（创建 Release 时填写的正文），由用户自行选择是否下载安装或仅浏览器查看。
+        """
+        tag = str(cand.get("tag_name") or "").strip()
+        if not tag:
+            return
+
+        top = tk.Toplevel(root)
+        top.title("发现新版本")
+        top.configure(bg=BG_CARD)
+        top.attributes("-topmost", True)
+        top.transient(root)
+        top.grab_set()
+        top.minsize(520, 360)
+
+        ch_human = "Beta / 预发布" if cand.get("is_prerelease") else "正式版（Release）"
+        if cand.get("from_manifest"):
+            src_human = "版本清单（raw / version_manifest.json）"
+        elif cand.get("from_release"):
+            src_human = "GitHub Release"
+        else:
+            src_human = "仅 tag（未发 Release）"
+
+        tk.Label(
+            top,
+            text="发现新版本",
+            fg=FG_MAIN,
+            bg=BG_CARD,
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+
+        head_lines = [
+            f"远程版本：{tag}",
+            f"当前本地：{cur_ver}  |  通道：{ch_human}  |  来源：{src_human}",
+        ]
+        rtitle = str(cand.get("release_title") or "").strip()
+        if rtitle:
+            head_lines.insert(1, f"发布标题：{rtitle}")
+        if cand.get("skipped_releases_due_to_error"):
+            head_lines.append(
+                "提示：GitHub Releases 接口未访问成功（常见于未认证限流），已按 tag 判断版本；"
+                "可设置环境变量 GITHUB_TOKEN 或 AUTOFDX_GITHUB_TOKEN 后重试以显示发行说明。"
+            )
+        tk.Label(
+            top,
+            text="\n".join(head_lines),
+            fg=FG_MUTED,
+            bg=BG_CARD,
+            font=("Microsoft YaHei UI", 9),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        wrap = tk.Frame(top, bg=BG_CARD)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        tk.Label(wrap, text="更新说明", fg=FG_MUTED, bg=BG_CARD, font=("Microsoft YaHei UI", 9)).pack(anchor="w")
+
+        notes = str(cand.get("notes") or "").strip()
+        if not notes:
+            if cand.get("from_release"):
+                notes = "（本次 Release 未填写说明。你可在 GitHub 上编辑该 Release 补充后再检查更新。）"
+            else:
+                notes = (
+                    "（当前远程仅有 tag、未创建 GitHub Release，故无发行正文。）\n"
+                    "你可在发版时创建 Release 并撰写更新说明，下次检查更新将显示在此处。\n"
+                    "仍可选择「立即更新」拉取该 tag 对应源码，或先在浏览器中查看仓库。"
+                )
+
+        txt = scrolledtext.ScrolledText(
+            wrap,
+            height=14,
+            width=62,
+            wrap="word",
+            font=("Microsoft YaHei UI", 10),
+            bg=BG_SUBCARD,
+            fg=FG_MAIN,
+            insertbackground=FG_MAIN,
+            relief="flat",
+            padx=8,
+            pady=8,
+        )
+        txt.pack(fill="both", expand=True, pady=(4, 0))
+        txt.insert("1.0", notes)
+        txt.configure(state="disabled")
+
+        btn_row = tk.Frame(top, bg=BG_CARD)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        def close_top():
+            try:
+                top.grab_release()
+            except tk.TclError:
+                pass
+            top.destroy()
+
+        def do_install():
+            close_top()
+            _start_download_and_apply(tag, repo)
+
+        def do_browser():
+            url = str(cand.get("html_url") or "").strip()
+            if not url:
+                url = github_tree_url_for_tag(repo, tag)
+            webbrowser.open(url)
+
+        b_install = tk.Button(btn_row, text="立即更新", command=do_install, cursor="hand2")
+        b_open = tk.Button(btn_row, text="在浏览器中打开", command=do_browser, cursor="hand2")
+        b_close = tk.Button(btn_row, text="关闭", command=close_top, cursor="hand2")
+        style_button(b_install, normal_bg=ACCENT, hover_bg="#1d4ed8")
+        b_install.configure(fg="white", activeforeground="white")
+        style_button(b_open)
+        style_button(b_close)
+        b_install.pack(side="left", padx=(0, 8))
+        b_open.pack(side="left", padx=(0, 8))
+        b_close.pack(side="right")
+
+        top.protocol("WM_DELETE_WINDOW", close_top)
+
+    def on_check_update():
+        """按当前通道查询 GitHub Release（含说明）或回退 tag；新版本以独立窗口展示说明并可选更新。"""
+        nonlocal update_check_busy
+        if update_check_busy:
+            return
+        repo = (UPDATE_CHECK_GITHUB_REPO or "").strip()
+        if not repo:
+            messagebox.showwarning(
+                "检查更新",
+                "未配置 UPDATE_CHECK_GITHUB_REPO（见 autofdx/config.py）。",
+                parent=root,
+            )
+            return
+        update_check_busy = True
+        btn_check_update.set_text("检查中…")
+        ch = config_store.data.get("update_channel", "release")
+
+        def worker():
+            cand, err = fetch_latest_update_candidate(repo, ch)
+
+            def ui_done():
+                nonlocal update_check_busy
+                update_check_busy = False
+                btn_check_update.set_text("检查更新")
+                if err:
+                    messagebox.showerror("检查更新", err, parent=root)
+                    return
+                cur = APP_VERSION
+                tag = str(cand.get("tag_name") or "").strip()
+                ch_label = "Beta" if ch == "beta" else "正式版"
+                if not is_remote_newer(cur, tag):
+                    messagebox.showinfo(
+                        "检查更新",
+                        f"当前已是最新（{ch_label} 通道）。\n\n"
+                        f"本地：{cur}\n远程：{tag}",
+                        parent=root,
+                    )
+                    return
+                _show_new_version_dialog(repo, cur, cand)
+
+            root.after(0, ui_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    btn_check_update = create_round_button(
+        title_row,
+        text="检查更新",
+        command=on_check_update,
+        width=104,
+        height=32,
+        normal_bg=BTN_BG,
+        hover_bg=BTN_HOVER,
+        radius=12,
+        font=("Microsoft YaHei UI", 10, "bold"),
+    )
+    # 先 pack 右侧固定/关闭，再 pack 左侧标题与「检查更新」，避免布局互相挤压。
     for btn in (btn_win_pin, btn_win_close):
         btn.pack(side="left", padx=2, anchor="center")
     win_btn_host.pack(side="right", anchor="center")
     lbl_title.pack(side="left", anchor="center")
     lbl_f1_hint.pack(side="left", padx=(10, 0), anchor="center")
+    btn_check_update.pack(side="left", padx=(12, 0), anchor="center")
     refresh_pin_button()
     # 自定义标题栏拖动窗口（标题栏整块可拖，避免误拖内容区）
-    for w in (title_bar, title_row, lbl_title, lbl_f1_hint, win_btn_host, btn_win_pin, btn_win_close):
+    for w in (
+        title_bar,
+        title_row,
+        lbl_title,
+        lbl_f1_hint,
+        btn_check_update,
+        win_btn_host,
+        btn_win_pin,
+        btn_win_close,
+    ):
         w.bind("<ButtonPress-1>", on_title_press)
         w.bind("<B1-Motion>", on_title_drag)
 
@@ -1919,7 +2295,16 @@ def launch_floating_window(config_store, state, window_service):
         style="Like.Big.TCheckbutton",
         cursor="hand2",
     )
-    chk_auto_refill_stamina.pack(anchor="w", pady=(0, 0))
+    chk_auto_refill_stamina.pack(anchor="w", pady=(0, 2))
+    chk_update_beta = ttk.Checkbutton(
+        settings_inner,
+        text="Beta 更新通道（接收 GitHub 预发布；关闭则仅正式版 Release）",
+        variable=update_beta_var,
+        command=on_update_channel_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_update_beta.pack(anchor="w", pady=(0, 0))
     refresh_feature_option_states()
 
     submenu_host = tk.Frame(frame, bg=BG_APP)
@@ -1945,6 +2330,26 @@ def launch_floating_window(config_store, state, window_service):
     submenu_frame.bind("<Configure>", _on_submenu_configure)
     submenu_canvas.bind("<Configure>", _on_submenu_configure)
 
+    resize_row = tk.Frame(frame, bg=BG_APP, height=14)
+    try:
+        resize_row.configure(cursor="size_ns")
+    except tk.TclError:
+        pass
+    resize_row.pack(side="bottom", fill="x")
+    resize_handle = tk.Canvas(resize_row, width=20, height=14, bg=BG_APP, highlightthickness=0, bd=0)
+    try:
+        resize_handle.configure(cursor="size_nw_se")
+    except tk.TclError:
+        pass
+    resize_handle.pack(side="right", padx=(0, 2), pady=(0, 0))
+    resize_handle.create_line(7, 13, 19, 1, fill="#64748b", width=2)
+    resize_handle.create_line(12, 13, 19, 6, fill="#64748b", width=2)
+    resize_handle.create_line(17, 13, 19, 11, fill="#64748b", width=2)
+    resize_row.bind("<ButtonPress-1>", on_resize_press)
+    resize_row.bind("<B1-Motion>", lambda event: on_resize_drag(event, resize_width=False, resize_height=True))
+    resize_handle.bind("<ButtonPress-1>", on_resize_press)
+    resize_handle.bind("<B1-Motion>", on_resize_drag)
+
     def _on_mousewheel(event):
         # 仅在二级菜单展开时处理滚轮，避免影响其他区域。
         if not submenu_host.winfo_ismapped():
@@ -1963,19 +2368,135 @@ def launch_floating_window(config_store, state, window_service):
     # 使用全局绑定，避免鼠标位于子控件时滚轮事件丢失导致“滚不动”。
     root.bind_all("<MouseWheel>", _on_mousewheel, add="+")
     root.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel, add="+")
-    # 标定按钮横向网格排布：优先 4 列，空间不足时退化为 3 列。
-    column_count = 4 if win_w >= 820 else 3
+    def calibration_column_count(width):
+        width = int(width)
+        if width >= 1080:
+            return 5
+        if width >= 820:
+            return 4
+        return 3
+
+    def relayout_calibration_buttons(width=None):
+        nonlocal layout_column_count
+        if not calib_buttons:
+            return
+        current_width = int(width if width is not None else root.winfo_width())
+        column_count = calibration_column_count(current_width)
+        if column_count == layout_column_count:
+            return
+        layout_column_count = column_count
+        for btn in calib_buttons.values():
+            btn.grid_forget()
+        for idx, (key, _label) in enumerate(CALIBRATION_ITEMS):
+            row = idx // column_count
+            col = idx % column_count
+            calib_buttons[key].grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
+        for col in range(5):
+            submenu_frame.grid_columnconfigure(col, weight=1 if col < column_count else 0)
+
+    def refresh_responsive_layout(width=None, height=None):
+        nonlocal min_win_w
+        current_width = int(width if width is not None else root.winfo_width())
+        current_height = int(height if height is not None else root.winfo_height())
+        compact_width = current_width < 690
+
+        pin_w = btn_win_pin.min_width() if compact_width else 100
+        btn_win_pin.set_size(pin_w, 32)
+        btn_win_close.set_size(42, 32)
+        btn_check_update.set_size(btn_check_update.min_width() if compact_width else 104, 32)
+
+        if compact_width:
+            content_grid.grid_columnconfigure(0, weight=1)
+            content_grid.grid_columnconfigure(1, weight=0, minsize=0)
+            left_status_frame.grid_configure(row=0, column=0, sticky="ew", padx=(0, 0), pady=(0, 4))
+            top_btn_frame.grid_configure(row=1, column=0, sticky="w", padx=(0, 0), pady=(0, 0))
+            like_option_frame.grid_configure(row=2, column=0, rowspan=1, sticky="w", pady=(4, 0))
+        else:
+            content_grid.grid_columnconfigure(0, weight=1)
+            content_grid.grid_columnconfigure(1, weight=0, minsize=_right_col_minsize)
+            left_status_frame.grid_configure(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
+            top_btn_frame.grid_configure(row=1, column=0, sticky="w", padx=(0, 4), pady=(0, 0))
+            like_option_frame.grid_configure(row=0, column=1, rowspan=2, sticky="ns", pady=(0, 0))
+
+        content_outer_pad = 20 + 16 + 12
+        side_reserved = 0 if compact_width else _right_col_minsize + 12
+        button_area = max(1, current_width - content_outer_pad - side_reserved)
+        main_buttons = (
+            (btn_pause, 168),
+            (btn_menu, 140),
+            (btn_settings, 100),
+        )
+        pack_pad = 8 * len(main_buttons)
+        min_widths = [btn.min_width() for btn, _ in main_buttons]
+        design_widths = [design for _btn, design in main_buttons]
+        min_sum = sum(min_widths) + pack_pad
+        design_sum = sum(design_widths) + pack_pad
+        if button_area >= design_sum:
+            target_widths = design_widths
+        else:
+            extra = max(0, button_area - min_sum)
+            design_extra = max(1, sum(max(0, d - m) for d, m in zip(design_widths, min_widths)))
+            target_widths = [
+                int(m + extra * max(0, d - m) / design_extra)
+                for d, m in zip(design_widths, min_widths)
+            ]
+        btn_h = 38 if compact_width else 42
+        for (btn, _design), target in zip(main_buttons, target_widths):
+            btn.set_size(target, btn_h)
+        btn_exit_spacer.configure(width=0 if compact_width else max(0, button_area - sum(target_widths) - pack_pad))
+
+        status_side = 0 if compact_width else _right_col_minsize + 24
+        status_wrap_px = max(180, current_width - 20 - 16 - status_side)
+        if status_text_label is not None:
+            status_text_label.configure(wraplength=status_wrap_px)
+
+        relayout_calibration_buttons(current_width)
+        root.update_idletasks()
+        title_min_w = (
+            20
+            + 16
+            + lbl_title.winfo_reqwidth()
+            + lbl_f1_hint.winfo_reqwidth()
+            + btn_check_update.min_width()
+            + btn_win_pin.min_width()
+            + btn_win_close.min_width()
+            + 72
+        )
+        content_min_w = 20 + 16 + max(min_sum, chk_like_force.winfo_reqwidth())
+        min_win_w = max(460, title_min_w, content_min_w)
+        min_h = (
+            int(frame.cget("pady")) * 2
+            + title_bar.winfo_reqheight()
+            + title_sep.winfo_reqheight()
+            + content_card.winfo_reqheight()
+            + resize_row.winfo_reqheight()
+            + 10
+        )
+        try:
+            if submenu_host.winfo_ismapped():
+                chrome_h = (
+                    title_bar.winfo_height()
+                    + title_sep.winfo_height()
+                    + content_card.winfo_height()
+                    + resize_row.winfo_height()
+                    + 34
+                )
+                submenu_canvas.configure(height=max(120, current_height - chrome_h))
+                submenu_canvas.itemconfigure(submenu_canvas_window, width=max(1, submenu_canvas.winfo_width()))
+                submenu_canvas.configure(scrollregion=submenu_canvas.bbox("all"))
+                min_h = max(min_h + 124, 320)
+        except tk.TclError:
+            pass
+        root.minsize(min_win_w, max(min_win_h, int(min_h)))
+
+    # 标定按钮横向网格排布：随窗口宽度在 3/4/5 列之间自适应。
     for key, label in CALIBRATION_ITEMS:
-        idx = len(calib_buttons)
-        row = idx // column_count
-        col = idx % column_count
         btn = tk.Button(submenu_frame, text=label, width=12, command=lambda k=key: trigger_item(k))
         style_button(btn, normal_bg=BTN_DANGER, hover_bg="#dc2626")
-        btn.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
         calib_buttons[key] = btn
 
-    for col in range(column_count):
-        submenu_frame.grid_columnconfigure(col, weight=1)
+    relayout_calibration_buttons(win_w)
+    refresh_responsive_layout(win_w, win_h_collapsed)
 
     def fit_collapsed_height():
         """
@@ -1988,9 +2509,14 @@ def launch_floating_window(config_store, state, window_service):
                 return
         except tk.TclError:
             return
+        try:
+            settings_open = settings_host is not None and settings_host.winfo_ismapped()
+        except tk.TclError:
+            return
         root.update_idletasks()
-        h = max(200, int(root.winfo_reqheight()))
-        win_h_collapsed = h
+        h = max(min_win_h, int(root.winfo_reqheight()), int(win_h_collapsed))
+        if not settings_open:
+            win_h_collapsed = h
         cx, cy = clamp_window_pos(h, root.winfo_x(), root.winfo_y())
         root.geometry(f"{win_w}x{h}+{cx}+{cy}")
 

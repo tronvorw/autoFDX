@@ -9,6 +9,18 @@ CONFIG_PATH = DATA_DIR / "user_config.json"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 TEMPLATES_DIR = ASSETS_DIR / "templates"
 
+# ---------------------------------------------------------------------------
+# 版本与在线更新（悬浮窗「检查更新」；自动替换依赖 tools/apply_update.py）
+# 发布新 tag 时请同步修改 APP_VERSION。
+# ---------------------------------------------------------------------------
+APP_VERSION = "1.0.0-beta.2"
+UPDATE_CHECK_GITHUB_REPO = "tronvorw/autoFDX"
+# 当 api.github.com 因「共享出口 IP」匿名限流时，从下列地址拉取清单（与发版 tag 同步维护）。
+UPDATE_MANIFEST_FILENAME = "version_manifest.json"
+UPDATE_MANIFEST_BRANCHES = ("main", "master")
+# 可选：任意 HTTPS 上托管的清单 JSON（格式同 version_manifest.json）。优先于 raw/jsDelivr。
+UPDATE_MANIFEST_OVERRIDE_URL = ""
+
 CALIBRATION_ITEMS = [
     ("start", "开始按钮"),
     ("cum2", "高潮按钮"),
@@ -79,6 +91,8 @@ def build_default_config():
         "scroll_region": [0.46, 0.42, 0.54, 0.58],
         "safe_move_point": [0.95, 0.92],
         "ui_window_pos": [20, 20],
+        "ui_window_size": [780, 200],
+        "ui_window_expanded_size": [780, 500],
         "custom_templates": {},
         # “拉出新实验滚动”动作标定结果：
         # - x/y: 归一化鼠标坐标
@@ -117,9 +131,16 @@ def build_default_config():
         "single_cum_mode_enabled": False,
         # 自动补充体力：回合结束、点击「开始」前，若体力显示模板出现则点体力再点凝胶确认。
         "auto_refill_stamina_enabled": False,
+        # 女进度条停滞恢复：多次 ESC 仍无法回到开始按钮时，尝试按 J/K 释放游戏卡死态。
+        "stall_recovery_rescue_enabled": True,
+        "stall_recovery_esc_attempts_before_rescue": 3,
+        "stall_recovery_rescue_keys": ["j", "k"],
+        "stall_recovery_rescue_mode": "alternate",
         # 叠加层模式开关（预留）：
         # False=常规悬浮窗；True=用户选择 DX Hook/Overlay 路径（实验项）。
         "overlay_dx_hook_enabled": False,
+        # 在线更新通道：release=仅正式版 GitHub Release（及无 Release 时的正式 tag）；beta=含预发布。
+        "update_channel": "release",
         "calibration_done": build_default_done_flags(),
         "calibration_rects": {
             "start": [0.35, 0.82, 0.45, 0.89],
@@ -256,11 +277,46 @@ class ConfigStore:
         # 点赞开关与“下一次立即点赞”标记补默认值。
         self.data.setdefault("like_enabled", True)
         self.data.setdefault("like_force_next", False)
+        ui_size = self.data.get("ui_window_size", defaults["ui_window_size"])
+        if not (isinstance(ui_size, list) and len(ui_size) == 2):
+            ui_size = defaults["ui_window_size"]
+        try:
+            self.data["ui_window_size"] = [max(460, int(ui_size[0])), max(180, int(ui_size[1]))]
+        except Exception:
+            self.data["ui_window_size"] = list(defaults["ui_window_size"])
+        ui_expanded_size = self.data.get("ui_window_expanded_size", defaults["ui_window_expanded_size"])
+        if not (isinstance(ui_expanded_size, list) and len(ui_expanded_size) == 2):
+            ui_expanded_size = defaults["ui_window_expanded_size"]
+        try:
+            self.data["ui_window_expanded_size"] = [
+                max(460, int(ui_expanded_size[0])),
+                max(320, int(ui_expanded_size[1])),
+            ]
+        except Exception:
+            self.data["ui_window_expanded_size"] = list(defaults["ui_window_expanded_size"])
         # 实验切换总开关补默认值。
         self.data.setdefault("experiment_switch_enabled", False)
         # 单高潮模式开关补默认值。
         self.data.setdefault("single_cum_mode_enabled", False)
         self.data.setdefault("auto_refill_stamina_enabled", False)
+        self.data.setdefault("stall_recovery_rescue_enabled", True)
+        try:
+            self.data["stall_recovery_esc_attempts_before_rescue"] = max(
+                1, int(self.data.get("stall_recovery_esc_attempts_before_rescue", 3))
+            )
+        except Exception:
+            self.data["stall_recovery_esc_attempts_before_rescue"] = 3
+        rescue_keys = self.data.get("stall_recovery_rescue_keys", ["j", "k"])
+        if not isinstance(rescue_keys, list):
+            rescue_keys = ["j", "k"]
+        rescue_keys = [str(k).strip().lower() for k in rescue_keys if str(k).strip()]
+        if not rescue_keys:
+            rescue_keys = ["j", "k"]
+        self.data["stall_recovery_rescue_keys"] = rescue_keys
+        rescue_mode = str(self.data.get("stall_recovery_rescue_mode", "alternate")).strip().lower()
+        if rescue_mode not in ("first", "alternate", "random"):
+            rescue_mode = "alternate"
+        self.data["stall_recovery_rescue_mode"] = rescue_mode
         self.data.setdefault("like_pool_ring_width_ratio", 0.14)
         self.data.setdefault("like_pool_blue_full_threshold", 0.90)
         # 实验切换：补齐当前实验索引与 12 点网格数据。
@@ -296,6 +352,9 @@ class ConfigStore:
             self.data["pull_new_experiment_scroll_action"] = action
         # DX Hook/Overlay 选择项补默认值。
         self.data.setdefault("overlay_dx_hook_enabled", False)
+        # 检查更新：Release / Beta 通道。
+        ch = self.data.get("update_channel", "release")
+        self.data["update_channel"] = ch if ch in ("release", "beta") else "release"
 
     def _ensure_asset_dirs(self):
         # 固定数据/素材目录，避免散落在项目根目录。

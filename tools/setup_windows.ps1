@@ -74,18 +74,12 @@ function Assert-PythonVersion($pyExe) {
 # ── 验证关键包能否正常导入 ────────────────────────────────────────────────────
 function Test-Imports($pyExe) {
     $checks = @(
-        @{ module = "cv2";          label = "opencv-python" },
-        @{ module = "numpy";       label = "numpy" },
-        @{ module = "PIL";        label = "Pillow" },
-        @{ module = "pyscreeze";   label = "pyscreeze" },
-        @{ module = "pymsgbox";   label = "pymsgbox" },
-        @{ module = "pytweening"; label = "pytweening" },
-        @{ module = "mouseinfo";  label = "mouseinfo" },
-        @{ module = "pyperclip";  label = "pyperclip" },
-        @{ module = "pyrect";     label = "pyrect" },
-        @{ module = "pygetwindow"; label = "pygetwindow" },
-        @{ module = "pyautogui";   label = "pyautogui" },
-        @{ module = "keyboard";   label = "keyboard" }
+        @{ module = "cv2";       label = "opencv-python" },
+        @{ module = "numpy";     label = "numpy" },
+        @{ module = "PIL";       label = "Pillow" },
+        @{ module = "pyscreeze"; label = "pyscreeze" },
+        @{ module = "pyautogui"; label = "pyautogui" },
+        @{ module = "keyboard";  label = "keyboard" }
     )
     $allOk = $true
     foreach ($c in $checks) {
@@ -154,23 +148,16 @@ try {
     & $pyExe -m pip install --upgrade pip --no-warn-script-location
 
     # ── 步骤 4：安装依赖 ───────────────────────────────────────────────────────
-    # 优先使用根目录 requirements.txt（内含 -r tools/requirements.txt），否则直接使用 tools 清单。
-    $reqFile = $null
-    if (Test-Path "requirements.txt") {
-        $reqFile = "requirements.txt"
-    } elseif (Test-Path "tools/requirements.txt") {
-        $reqFile = "tools/requirements.txt"
-    }
-    if (-not $reqFile) {
-        throw "找不到 requirements.txt 或 tools/requirements.txt，当前目录：$(Get-Location)"
+    if (-not (Test-Path "tools/requirements.txt")) {
+        throw "找不到 tools/requirements.txt，当前目录：$(Get-Location)"
     }
 
-    Write-Step "[4/5] 安装依赖包 ($reqFile)..."
-    Write-Info "opencv / numpy / Pillow / pyautogui 链 / keyboard 等均已在清单中显式声明。"
+    Write-Step "[4/5] 安装依赖包 (tools/requirements.txt)..."
+    Write-Info "pyautogui 全部子依赖已在 requirements.txt 中显式声明，确保完整安装。"
 
     # --prefer-binary  → 优先下载预编译 wheel，避免无 MSVC 时 C 扩展编译失败
     # --no-warn-script-location → 抑制 Scripts 目录不在 PATH 的警告（刷新后自然解决）
-    & $pyExe -m pip install -r $reqFile --prefer-binary --no-warn-script-location
+    & $pyExe -m pip install -r tools/requirements.txt --prefer-binary --no-warn-script-location
     Refresh-EnvPath
 
     # ── 步骤 5：导入验证 ───────────────────────────────────────────────────────

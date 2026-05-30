@@ -1,7 +1,4 @@
 @echo off
-REM autoFDX Windows setup: Python 3.12 + pip (see tools/setup_windows.ps1)
-REM Requirements: tools\requirements.txt ; root requirements.txt uses -r to include it
-REM Manual install: pip install -r requirements.txt
 setlocal EnableExtensions
 cd /d "%~dp0"
 

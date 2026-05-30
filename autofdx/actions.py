@@ -325,6 +325,36 @@ class GameActions:
         point = self._point_by_1based_index(self.config.get("experiment_points", []), index_1based)
         return self._click_point(point)
 
+    def estimate_selected_body_part_index_1based(self, min_spread=10.0):
+        """
+        根据当前游戏窗口截图：对 7 个身体部位六边形（与标定一致）内部求平均灰度，
+        最暗的一格通常对应 UI「当前选中」。
+        返回 1~7；若七格亮度差小于 min_spread（0~255）或未标定齐 7 点，返回 None。
+        """
+        from .body_part_hex import detect_selected_body_part_by_darkest_hex
+
+        parts = self.config.get("body_part_points", [])
+        if len(parts) != 7:
+            return None
+        try:
+            r = float(self.config.get("body_part_hex_radius_px", 20.0))
+        except Exception:
+            r = 20.0
+        try:
+            screen = self.vision_service.capture_screen()
+        except Exception:
+            return None
+        if screen is None or screen.size == 0:
+            return None
+        h, w = screen.shape[:2]
+        centers = []
+        for p in parts:
+            if isinstance(p, (list, tuple)) and len(p) == 2:
+                centers.append((float(p[0]) * w, float(p[1]) * h))
+        if len(centers) != 7:
+            return None
+        return detect_selected_body_part_by_darkest_hex(screen, centers, r, min_spread=float(min_spread))
+
     def has_experiment_selected_flag(self):
         """
         检测「实验选定标志」模板是否出现（遗留项，实验切换/bootstrap 已改用语义见 has_body_part_switch_visible）。
@@ -577,10 +607,11 @@ class GameActions:
         norm = rect_map.get(key)
         if (not isinstance(norm, list)) or len(norm) != 4:
             return None
+        left, top, _, _ = self.window_service.get_window_region()
         x1, y1, x2, y2 = self.window_service.denormalize_region(norm)
         if x2 <= x1 or y2 <= y1:
             return None
-        shot = pyautogui.screenshot(region=(x1, y1, x2 - x1, y2 - y1))
+        shot = pyautogui.screenshot(region=(left + x1, top + y1, x2 - x1, y2 - y1))
         return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
 
     def _build_red_mask(self, bgr_img):

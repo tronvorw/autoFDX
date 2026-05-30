@@ -1,3 +1,4 @@
+import random
 import threading
 from time import monotonic, sleep, time
 
@@ -121,6 +122,8 @@ class AutomationEngine:
         self._like_pool_poll_last_mono = None
         # 边沿：蓝占比先低于阈值后再涨满才触发下一轮 give，避免长时间满池时每 5 秒重复点赞。
         self._like_pool_armed_single_cum = True
+        # 女条停滞恢复兜底：多次 ESC 失败后按 J/K 时，alternate 模式从这里轮换。
+        self._stall_recovery_rescue_next_index = 0
 
     def _special_action_should_abort(self):
         """
@@ -169,6 +172,9 @@ class AutomationEngine:
         if self._single_cum_mode_enabled():
             return
         if not bool(self.config_store.data.get("like_enabled", True)):
+            msg = "主模式跳过：点赞功能未开启"
+            print(f"\n[赞池] {msg}")
+            self.state.log(msg)
             return
 
         if bool(self.config_store.data.get("like_force_next", False)):
@@ -181,15 +187,28 @@ class AutomationEngine:
             return
 
         if not bool(self.config_store.data.get("calibration_done", {}).get("like_pool")):
+            msg = "主模式跳过：赞池未标定"
+            print(f"\n[赞池] {msg}")
+            self.state.log(msg)
             return
         pts = self.config_store.data.get("like_points", [])
         if not isinstance(pts, list) or len(pts) < 6:
+            count = len(pts) if isinstance(pts, list) else 0
+            msg = f"主模式跳过：点赞点位不完整（{count}/6）"
+            print(f"\n[赞池] {msg}")
+            self.state.log(msg)
             return
 
         ratio = self.vision_service.like_pool_blue_fill_ratio()
         if ratio is None:
+            msg = "主模式检测失败：圆环区域无效或截图失败"
+            print(f"\n[赞池] {msg}")
+            self.state.log(msg)
             return
         th = float(self.config_store.data.get("like_pool_blue_full_threshold", 0.90))
+        msg = f"主模式检测：圆环蓝占比 {ratio:.1%}，阈值 {th:.1%}"
+        print(f"\n[赞池] {msg}")
+        self.state.log(msg)
         if ratio < th:
             return
 
@@ -1100,31 +1119,118 @@ class AutomationEngine:
             self._special_action_monitor_thread.join(timeout=1.0)
         self._special_action_monitor_thread = None
 
+    def _stall_recovery_rescue_keys(self):
+        keys = self.config_store.data.get("stall_recovery_rescue_keys", ["j", "k"])
+        if not isinstance(keys, list):
+            return ["j", "k"]
+        cleaned = [str(key).strip().lower() for key in keys if str(key).strip()]
+        return cleaned or ["j", "k"]
+
+    def _next_stall_recovery_rescue_key(self):
+        keys = self._stall_recovery_rescue_keys()
+        mode = str(self.config_store.data.get("stall_recovery_rescue_mode", "alternate")).strip().lower()
+        if mode == "random":
+            return random.choice(keys)
+        if mode == "first":
+            return keys[0]
+        key = keys[self._stall_recovery_rescue_next_index % len(keys)]
+        self._stall_recovery_rescue_next_index += 1
+        return key
+
+    def _wait_stall_recovery_surface(self, timeout_sec=3.0, poll_interval_sec=0.10):
+        deadline = monotonic() + max(0.2, float(timeout_sec))
+        while monotonic() < deadline:
+            if self._wait_if_paused_or_interrupted():
+                return "interrupted"
+            if self.actions.ready_to_start():
+                return "start"
+            if self.actions.ready_to_finish():
+                return "finish"
+            sleep(max(0.03, float(poll_interval_sec)))
+        return None
+
+    def _escape_or_rescue_stall_recovery_surface(self):
+        try:
+            esc_attempts = max(1, int(self.config_store.data.get("stall_recovery_esc_attempts_before_rescue", 3)))
+        except Exception:
+            esc_attempts = 3
+
+        for attempt in range(1, esc_attempts + 1):
+            self.state.set_status(f"女进度条停滞：ESC恢复尝试 {attempt}/{esc_attempts}")
+            print(f"\n[女进度条停滞] ESC恢复尝试 {attempt}/{esc_attempts}，等待开始/结束按钮。")
+            pyautogui.press("esc")
+            surface = self._wait_stall_recovery_surface(timeout_sec=3.0)
+            if surface in ("start", "finish", "interrupted"):
+                return surface
+
+        if not bool(self.config_store.data.get("stall_recovery_rescue_enabled", True)):
+            return None
+
+        keys = self._stall_recovery_rescue_keys()
+        for rescue_attempt in range(1, len(keys) + 1):
+            key = self._next_stall_recovery_rescue_key()
+            self.state.set_status(f"女进度条停滞：ESC失败，尝试按 {key.upper()}")
+            print(
+                f"\n[女进度条停滞] {esc_attempts} 次 ESC 后仍未出现开始/结束按钮，"
+                f"尝试按 {key.upper()} 释放卡死态（{rescue_attempt}/{len(keys)}）。"
+            )
+            pyautogui.press(key)
+            surface = self._wait_stall_recovery_surface(timeout_sec=3.0)
+            if surface in ("start", "finish", "interrupted"):
+                return surface
+
+        return None
+
+    def _click_finish_until_start_after_stall_rescue(self):
+        deadline = monotonic() + 8.0
+        while monotonic() < deadline:
+            if self._wait_if_paused_or_interrupted():
+                return False
+            if self.actions.ready_to_start():
+                return True
+            if self.actions.ready_to_finish():
+                clicked = self.actions.finish()
+                if clicked:
+                    self.state.log("停滞恢复：点击结束")
+                else:
+                    self.state.log("停滞恢复：结束按钮点击未确认，重试")
+                sleep(0.2)
+                continue
+            sleep(0.2)
+        return False
+
     def _recover_after_female_bar_stall(self, bar_balance_tolerance):
         """
         按“女进度条停滞恢复流程”执行恢复并重启当前实验：
-        1) 先按一次 ESC，等待开始按钮；
-        2) 若 3 秒内未出现开始按钮，再补按一次 ESC 后继续等待；
-        3) 开始按钮出现后等待 2 秒；
-        4) 持续检测女/男进度条占比，满足以下任一条件后循环点击开始按钮：
+        1) 多次 ESC，等待开始按钮或结束按钮；
+        2) 若 ESC 仍失效，按 J/K 释放游戏卡死态；
+        3) 若出现结束按钮，先点击结束并等待开始按钮；
+        4) 开始按钮出现后等待 2 秒；
+        5) 持续检测女/男进度条占比，满足以下任一条件后循环点击开始按钮：
            - 两者差值 <= 20%（近似相等）；
            - 两者占比都为 0（视为相等）；
            - 女进度条 > 男进度条 且 女进度条 < 60%（允许继续运行）。
         """
-        print("\n[女进度条停滞] 执行恢复：ESC → 等待开始按钮（3秒内未出现则再按一次ESC）→ 等待2秒 → 双条近似相等后点击开始。")
+        print("\n[女进度条停滞] 执行恢复：多次 ESC → 必要时 J/K 释放 → 等待开始按钮 → 双条近似相等后点击开始。")
         self.state.set_status("女进度条停滞：恢复中")
         # 停滞恢复场景单独放宽判定：按需求固定使用 20% 容差。
         near_equal_tolerance = max(float(bar_balance_tolerance), 0.20)
 
-        pyautogui.press("esc")
-        # 首次等待窗口：3 秒内若开始按钮未出现，按需求补按一次 ESC。
-        if not self.actions.wait_start_button(timeout_sec=3.0, poll_interval_sec=0.10):
-            pyautogui.press("esc")
-            self.state.set_status("女进度条停滞：二次ESC后等待开始按钮")
-            while not self.actions.ready_to_start():
-                if self._wait_if_paused_or_interrupted():
-                    return False
-                sleep(0.2)
+        surface = self._escape_or_rescue_stall_recovery_surface()
+        if surface == "interrupted":
+            return False
+        if surface is None:
+            self.state.manual_pause = True
+            self.state.set_status("女进度条停滞：恢复失败，已暂停")
+            print("\n[女进度条停滞] 恢复失败：多次 ESC 与 J/K 后仍未出现开始/结束按钮，已暂停。")
+            return False
+        if surface == "finish":
+            self.state.set_status("女进度条停滞：点击结束后等待开始")
+            if not self._click_finish_until_start_after_stall_rescue():
+                self.state.manual_pause = True
+                self.state.set_status("女进度条停滞：结束后未出现开始，已暂停")
+                print("\n[女进度条停滞] 已尝试点击结束，但未等到开始按钮，已暂停。")
+                return False
 
         # 保险等待：即便 3 秒内已出现，也统一进入“开始按钮稳定后再操作”节奏。
         self.state.set_status("女进度条停滞：开始按钮已出现，等待2秒")
@@ -1460,9 +1566,22 @@ class AutomationEngine:
             self.state.log("等待结束")
             self.actions.wait(0.2)
 
-        while self.actions.ready_to_finish():
+        finish_missing_checks = 0
+        while True:
             if self._wait_if_paused_or_interrupted():
                 return
+            if not self.actions.ready_to_finish():
+                # 进入结束阶段后，不能因单帧模板 miss 就直接推进到下一轮；
+                # 只有开始按钮出现，才说明“再来一次/结束”阶段已经真正结束。
+                if self.actions.ready_to_start():
+                    self.state.log("结束按钮已消失，等待开始")
+                    return
+                finish_missing_checks += 1
+                if finish_missing_checks == 1 or finish_missing_checks % 5 == 0:
+                    self.state.log("结束按钮短暂未匹配，继续确认")
+                self.actions.wait(0.2)
+                continue
+            finish_missing_checks = 0
             clicked = self.actions.finish()
             if not clicked:
                 self.state.log("结束按钮点击未确认，重试")
@@ -1483,6 +1602,7 @@ class AutomationEngine:
                     self._switch_after_five_on_start_pending = True
                     self.state.set_status("实验5次完成，等待开始按钮后切换")
                     return
+            return
 
     def run_forever(self):
         self._register_hotkeys()
