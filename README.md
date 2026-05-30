@@ -86,5 +86,5 @@ python fallen_doll.py
 
 ## 6. 赞助支持
 
-开发并非易事，如果您愿意，请我吃颗棒棒糖吧！
+开发并非易事，如果您愿意支持开发，可通过 **爱发电**：[https://ifdian.net/a/tronvorw](https://ifdian.net/a/tronvorw)
 
