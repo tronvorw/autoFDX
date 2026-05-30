@@ -1534,6 +1534,22 @@ def launch_floating_window(config_store, state, window_service):
     # 设置面板容器：在下方 content_card 内实例化；此处先占位，避免高度同步函数在定义阶段引用未赋值。
     settings_host = None
 
+    def _height_for_collapsed_shell():
+        """
+        折叠态目标高度：以当前内容 reqheight 为准。
+        若物理高度仍停留在「刚收起子面板」的展开高度，允许收矮（勿与 win_h_collapsed 取 max，否则会卡住）。
+        若已在折叠高度附近，则保留用户曾手动拉高的 win_h_collapsed。
+        """
+        root.update_idletasks()
+        content_h = max(min_win_h, int(root.winfo_reqheight()))
+        try:
+            cur_h = int(root.winfo_height())
+        except tk.TclError:
+            return content_h
+        if cur_h > content_h + 4:
+            return content_h
+        return max(content_h, int(win_h_collapsed))
+
     def _apply_shell_height():
         """
         根据「标定子菜单 / 设置面板」展开状态同步主窗口高度。
@@ -1552,8 +1568,7 @@ def launch_floating_window(config_store, state, window_service):
         if sub_open:
             nh = max(win_h_expanded, 320 + settings_extra)
         else:
-            root.update_idletasks()
-            nh = max(min_win_h, int(root.winfo_reqheight()), int(win_h_collapsed))
+            nh = _height_for_collapsed_shell()
             if not set_open:
                 win_h_collapsed = nh
         cx, cy = clamp_window_pos(nh, root.winfo_x(), root.winfo_y())
@@ -1574,6 +1589,7 @@ def launch_floating_window(config_store, state, window_service):
         _apply_shell_height()
         if not submenu_host.winfo_ismapped():
             root.after(10, fit_collapsed_height)
+            root.after(50, fit_collapsed_height)
 
     def toggle_submenu():
         if submenu_host.winfo_ismapped():
@@ -1583,6 +1599,7 @@ def launch_floating_window(config_store, state, window_service):
         _apply_shell_height()
         if not submenu_host.winfo_ismapped():
             root.after(10, fit_collapsed_height)
+            root.after(50, fit_collapsed_height)
 
     def trigger_item(item_key):
         # 女/男条依赖敏感条的宽高与水平位置，必须先完成敏感进度条标定。
@@ -2090,10 +2107,17 @@ def launch_floating_window(config_store, state, window_service):
                 tag = str(cand.get("tag_name") or "").strip()
                 ch_label = "Beta" if ch == "beta" else "正式版"
                 if not is_remote_newer(cur, tag):
+                    src = "版本清单" if cand.get("from_manifest") else "GitHub API / tag"
+                    hint = ""
+                    if cand.get("from_manifest") and is_remote_newer(tag, cur):
+                        hint = (
+                            "\n\n提示：远程清单版本低于本地（多为 raw 缓存未刷新）。"
+                            "请稍后再试「检查更新」，或确认仓库 main 上 version_manifest.json 已为最新。"
+                        )
                     messagebox.showinfo(
                         "检查更新",
                         f"当前已是最新（{ch_label} 通道）。\n\n"
-                        f"本地：{cur}\n远程：{tag}",
+                        f"本地：{cur}\n远程：{tag}\n来源：{src}{hint}",
                         parent=root,
                     )
                     return
@@ -2513,8 +2537,7 @@ def launch_floating_window(config_store, state, window_service):
             settings_open = settings_host is not None and settings_host.winfo_ismapped()
         except tk.TclError:
             return
-        root.update_idletasks()
-        h = max(min_win_h, int(root.winfo_reqheight()), int(win_h_collapsed))
+        h = _height_for_collapsed_shell()
         if not settings_open:
             win_h_collapsed = h
         cx, cy = clamp_window_pos(h, root.winfo_x(), root.winfo_y())

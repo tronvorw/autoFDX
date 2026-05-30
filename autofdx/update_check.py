@@ -15,6 +15,7 @@ import json
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -262,10 +263,14 @@ def _collect_manifest_urls(owner_repo: str) -> list[str]:
     add((os.environ.get("AUTOFDX_UPDATE_MANIFEST_URL") or "").strip())
 
     if owner_repo and "/" in owner_repo:
+        # 查询参数仅用于绕过 raw/jsDelivr 对 main 上清单的短时旧缓存，避免「仓库已 beta.3 但检查仍读到 beta.2」。
+        bust = int(time.time())
         for br in UPDATE_MANIFEST_BRANCHES:
-            add(f"https://raw.githubusercontent.com/{owner_repo}/{br}/{UPDATE_MANIFEST_FILENAME}")
-            # jsDelivr：gh/用户/仓库@分支/路径（发布后有数分钟缓存延迟，一般可接受）
-            add(f"https://cdn.jsdelivr.net/gh/{owner_repo}@{br}/{UPDATE_MANIFEST_FILENAME}")
+            q = f"?_={bust}"
+            add(
+                f"https://raw.githubusercontent.com/{owner_repo}/{br}/{UPDATE_MANIFEST_FILENAME}{q}"
+            )
+            add(f"https://cdn.jsdelivr.net/gh/{owner_repo}@{br}/{UPDATE_MANIFEST_FILENAME}{q}")
     return out
 
 

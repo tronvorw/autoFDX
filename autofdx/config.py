@@ -13,7 +13,7 @@ TEMPLATES_DIR = ASSETS_DIR / "templates"
 # 版本与在线更新（悬浮窗「检查更新」；自动替换依赖 tools/apply_update.py）
 # 发布新 tag 时请同步修改 APP_VERSION。
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.0.0-beta.3"
+APP_VERSION = "1.0.0-beta.4"
 UPDATE_CHECK_GITHUB_REPO = "tronvorw/autoFDX"
 # 当 api.github.com 因「共享出口 IP」匿名限流时，从下列地址拉取清单（与发版 tag 同步维护）。
 UPDATE_MANIFEST_FILENAME = "version_manifest.json"
