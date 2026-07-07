@@ -5,14 +5,41 @@ from time import monotonic, sleep, time
 import keyboard
 import pyautogui
 
+from . import log_codes as C
+from .run_log import log, log_debug
+
 # 女进度条停滞：建立基线后，若连续该秒数内女条（b1）无有效增长则触发停滞（秒）。
 FEMALE_BAR_STALL_NO_INCREASE_SECONDS = 5.0
+# 女条填充率至少上升该比例才视为「有效增长」（过滤识别抖动）。
+FEMALE_BAR_STALL_GROWTH_EPSILON = 0.012
 # 武装停滞检测后、或 F1 恢复后：该秒内不因“未增长”判停滞（开局/恢复后女条常短暂不动，易误判）。
-FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC = 6.0
-# 主键盘按「1」触发特殊动作后：至少经过该秒数，才用「模板匹配」判定重新出现。
-SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC = 1.0
+FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC = 3.5
+# 按「1」后：暂停女条停滞判定的固定时长（秒）；不再无限等待按钮再出现。
+FEMALE_BAR_STALL_SUSPEND_AFTER_ONE_SEC = 3.5
+# 主键盘按「1」后：至少经过该秒数才允许再次判红触发；女条停滞恢复亦在此后判定。
+SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC = 0.7
+# 特殊动作监测轮询间隔（秒）：越小响应越快，但截图/匹配更频繁。
+SPECIAL_ACTION_POLL_INTERVAL_SEC = 0.04
+# 判红满足后、发送「1」前的短延时（秒）；保留 abort 二次校验，防误触。
+SPECIAL_ACTION_PRESS_DELAY_SEC = 0.06
+# 连续两次触发「1」的最小间隔（秒）；防按键洪泛，不影响首次触发。
+SPECIAL_ACTION_TRIGGER_COOLDOWN_SEC = 0.55
+# 按「1」后：敏感条相对触发基线至少上升该比例，才允许下一次触发（见 详细流程逻辑.md §3）。
+SPECIAL_ACTION_SENSITIVE_RISE_MIN = 0.02
+# 敏感条达标上升后，额外等待该秒数再允许下一次触发。
+SPECIAL_ACTION_POST_RISE_DELAY_SEC = 3.0
+# 敏感条填充 ≥ 该比例时不再触发特殊动作（略低于 80% 以匹配视觉满条读数）。
+SPECIAL_ACTION_SENSITIVE_MAX = 0.77
+SPECIAL_ACTION_SENS_EMA_ALPHA = 0.40
+SPECIAL_ACTION_RISE_STALL_SEC = 12.0
+SPECIAL_ACTION_PHASE_WARMUP_SEC = 1.2
 # 单高潮模式：赞池蓝色占比检测最小间隔（秒），与「随时随地」轮询并存，避免高频截图。
 LIKE_POOL_POLL_INTERVAL_SINGLE_CUM_SEC = 5.0
+# 实验切换模式：开始按钮连续点击未确认（模板未消失）达此次数后，ESC 退出并重新部署当前实验。
+START_CLICK_FAIL_RECOVERY_THRESHOLD = 10
+# 高潮后等待「再来一次/结束」按钮：超过该秒数仍不出现则 ESC 直到看到开始或结束按钮。
+FINISH_WAIT_TIMEOUT_SEC = 20.0
+FINISH_WAIT_ESC_MAX = 30
 
 
 def _sleep_interruptible(total_sec, state, step_sec=0.05):
@@ -81,23 +108,27 @@ class AutomationEngine:
         self._female_bar_monitor_active = False
         self._female_bar_monitor_stop = threading.Event()
         self._female_bar_monitor_thread = None
-        # 女进度条停滞检测“可恢复最早时间戳”（秒）：保留字段，当前与「等模板再出现」组合使用。
+        # 按「1」后暂停女条停滞判定的截止时间戳（秒）。
         self._female_bar_stall_suspend_until = 0.0
+        # 是否处于按「1」后的固定暂停窗口（用于暂停结束时的 SA008 与宽限期）。
+        self._female_bar_stall_in_suspend = False
         # 实验切换：首次部署后 / 每轮点击「开始」后，须先模板匹配到特殊动作按钮存在，再启动女条停滞检测。
         self._female_bar_stall_wait_special_visible_after_start = False
-        # 按下主键盘「1」后：延迟 SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC 秒，再任意一次模板匹配即视为重新出现并启动女条停滞检测。
-        self._female_bar_stall_wait_special_reappear = False
-        # 按「1」成功时刻起算，在此之前不接受「模板=重新出现」判定（与 press 内 0.2s 延迟区分）。
-        self._female_bar_stall_reappear_earliest_ts = 0.0
         # 早于该时刻不判女条停滞（宽限期结束时刻）；用于开局、按1后、F1恢复后防误判。
         self._female_bar_stall_grace_until = 0.0
         # 用于检测「刚从暂停恢复」，恢复时给一段宽限期。
         self._female_bar_monitor_was_paused = False
         # 特殊动作状态机（按新规则）：
-        # - 当“敏感进度条<80% 且 特殊动作按钮红色>60%”时，延迟 200ms 触发主键盘“1”；
-        # - 每次触发后暂停女条停滞检测，延迟后再用模板匹配判定重新出现。
-        # 连续触发节流时间戳：避免条件持续满足时每帧都触发按键。
+        # - 当“敏感进度条<阈值 且 特殊动作按钮红色>50%”时，短延时后连按主键盘「1」；
+        # - 每次触发后暂停女条停滞检测；须等敏感条相对基线上升后再允许下一次触发。
         self._special_action_last_trigger_ts = 0.0
+        self._special_action_wait_sensitive_rise = False
+        self._special_action_sensitive_baseline = None
+        self._special_action_sensitive_trough = None
+        self._special_action_sens_ema = None
+        self._special_action_rise_wait_since = 0.0
+        self._special_action_phase_started_at = 0.0
+        self._special_action_post_rise_until = 0.0
         self._special_action_monitor_active = False
         self._special_action_monitor_stop = threading.Event()
         self._special_action_monitor_thread = None
@@ -105,6 +136,8 @@ class AutomationEngine:
         # press 的 0.2s 延迟后仍发送「1」（阶段已结束或已暂停时偶发误触）。
         self._special_action_phase_token = 0
         self._special_action_expected_token = 0
+        self._special_action_diag_last_ts = {}
+        self._scene_poll_last_mono = 0.0
         # 降低 pyautogui 全局动作间隔，避免滚轮动作被库默认节流。
         # 调整为 0：进一步提升连续滚轮吞吐，解决“滚动距离/次数偏小”的问题。
         pyautogui.PAUSE = 0
@@ -124,6 +157,41 @@ class AutomationEngine:
         self._like_pool_armed_single_cum = True
         # 女条停滞恢复兜底：多次 ESC 失败后按 J/K 时，alternate 模式从这里轮换。
         self._stall_recovery_rescue_next_index = 0
+        # 开始按钮点击失败恢复（仅实验切换模式）：
+        # - 连续未确认次数；重新部署后首次仍失败则切下一实验。
+        self._start_click_consecutive_failures = 0
+        self._awaiting_first_start_after_redeploy = False
+        self._start_click_recovery_marked = False
+        self._runtime_start_click_recovery_count = 0
+
+    def _inp(self):
+        return self.actions._inp()
+
+    def _press_key(self, key):
+        inp = self._inp()
+        if inp is not None:
+            inp.press(key)
+        else:
+            pyautogui.press(key)
+
+    def _get_bar_ratios(self):
+        screen = self.vision_service.capture_screen()
+        return self.vision_service.detect_bars(screen)
+
+    def _poll_home_page_scene(self):
+        """周期性探测是否处于主页，并写入 state.scene_label 供悬浮窗展示。"""
+        now = monotonic()
+        if now - self._scene_poll_last_mono < 1.0:
+            return
+        self._scene_poll_last_mono = now
+        try:
+            is_home, matched, blockers = self.vision_service.detect_home_page()
+            self.state.scene_label = self.vision_service.format_home_page_scene_label(
+                is_home, matched, blockers
+            )
+            self.state.scene_matched_templates = list(matched)
+        except Exception:
+            self.state.scene_label = "页面未知"
 
     def _special_action_should_abort(self):
         """
@@ -147,12 +215,12 @@ class AutomationEngine:
 
     def _print_runtime_experiment_stats(self):
         """在控制台输出自程序启动以来的高潮次数与「5回合」完成个数。"""
-        extra = ""
-        if not bool(self.config_store.data.get("experiment_switch_enabled", False)):
-            extra = "（「5回合」计数需开启实验切换）"
-        print(
-            f"\n[统计] 自程序启动：高潮成功 {self._runtime_total_cum_successes} 次；"
-            f"完成「5回合」实验 {self._runtime_total_five_round_experiments} 个（以该组第 5 次成功高潮为准）{extra}"
+        log(
+            C.SYS002,
+            cum=self._runtime_total_cum_successes,
+            five=self._runtime_total_five_round_experiments,
+            sr=self._runtime_start_click_recovery_count,
+            exp_sw=int(bool(self.config_store.data.get("experiment_switch_enabled", False))),
         )
 
     def _single_cum_mode_enabled(self):
@@ -173,14 +241,14 @@ class AutomationEngine:
             return
         if not bool(self.config_store.data.get("like_enabled", True)):
             msg = "主模式跳过：点赞功能未开启"
-            print(f"\n[赞池] {msg}")
+            log(C.LP001, kind="skip", reason="disabled")
             self.state.log(msg)
             return
 
         if bool(self.config_store.data.get("like_force_next", False)):
             self.state.log("主模式：like_force_next 强制点赞")
             self.state.set_status("主模式：立即点赞（一次性）")
-            print("\n[点赞] 主模式：like_force_next 触发 give()")
+            log(C.LP001, kind="force", action="give")
             self.actions.give()
             self.config_store.data["like_force_next"] = False
             self.config_store.save()
@@ -188,35 +256,43 @@ class AutomationEngine:
 
         if not bool(self.config_store.data.get("calibration_done", {}).get("like_pool")):
             msg = "主模式跳过：赞池未标定"
-            print(f"\n[赞池] {msg}")
+            log(C.LP001, kind="skip", reason="no_cal")
             self.state.log(msg)
             return
         pts = self.config_store.data.get("like_points", [])
         if not isinstance(pts, list) or len(pts) < 6:
             count = len(pts) if isinstance(pts, list) else 0
             msg = f"主模式跳过：点赞点位不完整（{count}/6）"
-            print(f"\n[赞池] {msg}")
+            log(C.LP001, kind="skip", reason="pts", count=count)
             self.state.log(msg)
             return
 
         ratio = self.vision_service.like_pool_blue_fill_ratio()
         if ratio is None:
             msg = "主模式检测失败：圆环区域无效或截图失败"
-            print(f"\n[赞池] {msg}")
+            log(C.LP001, kind="fail", reason="ratio")
             self.state.log(msg)
             return
-        th = float(self.config_store.data.get("like_pool_blue_full_threshold", 0.90))
+        th = self._like_pool_full_threshold()
         msg = f"主模式检测：圆环蓝占比 {ratio:.1%}，阈值 {th:.1%}"
-        print(f"\n[赞池] {msg}")
+        log(C.LP001, kind="check", ratio=ratio, th=th)
         self.state.log(msg)
         if ratio < th:
             return
 
         msg = f"赞池已满：蓝占比 {ratio:.1%} ≥ 阈值 {th:.1%}，执行点赞（主模式·再来一次后）"
-        print(f"\n[赞池] {msg}")
+        log(C.LP001, kind="give", ratio=ratio, th=th)
         self.state.log(msg)
         self.state.set_status(f"赞池已满(蓝占比约{ratio:.0%})：执行点赞")
         self.actions.give()
+
+    def _like_pool_full_threshold(self):
+        """赞池满判定阈值；分段计数下建议 85%~95%，超出范围自动钳制。"""
+        try:
+            th = float(self.config_store.data.get("like_pool_blue_full_threshold", 0.90))
+        except Exception:
+            th = 0.90
+        return max(0.85, min(0.95, th))
 
     def _poll_like_pool_single_cum(self):
         """
@@ -245,7 +321,7 @@ class AutomationEngine:
         ratio = self.vision_service.like_pool_blue_fill_ratio()
         if ratio is None:
             return
-        th = float(self.config_store.data.get("like_pool_blue_full_threshold", 0.90))
+        th = self._like_pool_full_threshold()
         if ratio < th:
             self._like_pool_armed_single_cum = True
             return
@@ -254,7 +330,7 @@ class AutomationEngine:
         self._like_pool_armed_single_cum = False
 
         msg = f"赞池已满：蓝占比 {ratio:.1%} ≥ 阈值 {th:.1%}，执行点赞"
-        print(f"\n[赞池] {msg}")
+        log(C.LP001, kind="give", ratio=ratio, th=th)
         self.state.log(msg)
         self.state.set_status(f"赞池已满(蓝占比约{ratio:.0%})：执行点赞")
         self.actions.give()
@@ -408,7 +484,7 @@ class AutomationEngine:
 
         self.state.manual_pause = True
         self.state.set_status("实验切换缺少标定")
-        print(f"\n[实验切换] 缺少标定项：{', '.join(missing)}，已自动暂停。")
+        log(C.EX001, missing=",".join(missing))
         return False
 
     def _retry_experiment_panel_and_click_same_card(self, card_index_1based):
@@ -418,11 +494,137 @@ class AutomationEngine:
         本函数：ESC 关闭 → 再按 E 打开面板 → 稍等后再次点击同一张卡片。
         返回 True 表示再次点击已执行（不保证身体部位条已消失）。
         """
-        pyautogui.press("esc")
+        self._press_key("esc")
         sleep(1.0)
         self.actions.press_experiment_switch_hotkey()
         sleep(1.2)
         return bool(self.actions.click_experiment_card(card_index_1based))
+
+    def _deploy_current_experiment_card(self):
+        """
+        在已选定实验卡片的前提下尝试部署（左键 + 可选移动视角）。
+        返回 True 表示开始按钮与恢复体力按钮均已就绪。
+        """
+        sleep(1.0)
+        start_seen, both_ready = self.actions.deploy_and_check_start_recover(timeout_sec=2.0)
+        if both_ready:
+            sleep(1.0)
+            return True
+        if start_seen:
+            return False
+        if self._wait_if_paused_or_interrupted():
+            return False
+        log(C.EX007)
+        mv_start_seen, mv_both = self.actions.move_camera_burst_deploy_check()
+        if mv_both:
+            sleep(1.0)
+            return True
+        if mv_start_seen:
+            return False
+        return False
+
+    def _redeploy_same_experiment_after_start_fail(self):
+        """
+        开始按钮连续点击失败后：ESC 退出 → 重开面板 → 再次选定当前卡片并部署。
+        不改变 _experiment_cycle_count 与 _experiment_card_index。
+        """
+        card_index = self._experiment_card_index
+        cycle_count = self._experiment_cycle_count
+        log(C.SR001, n=START_CLICK_FAIL_RECOVERY_THRESHOLD, idx=card_index, marked=cycle_count)
+        self.state.set_status("开始按钮失败：重新部署当前实验")
+        self._press_key("esc")
+        sleep(1.0)
+        self.actions.press_experiment_switch_hotkey()
+        sleep(1.0)
+        sleep(1.0)
+        if not self.actions.click_experiment_card(card_index):
+            log(C.SR003, reason="card_click", idx=card_index)
+            return False
+        sel_confirm_timeout_sec = 3.5
+        body_part_hidden = self.actions.wait_until_body_part_switch_hidden(timeout_sec=sel_confirm_timeout_sec)
+        if not body_part_hidden:
+            if not self._retry_experiment_panel_and_click_same_card(card_index):
+                return False
+            body_part_hidden = self.actions.wait_until_body_part_switch_hidden(timeout_sec=sel_confirm_timeout_sec)
+        if not body_part_hidden:
+            log(C.SR003, reason="body_part", idx=card_index)
+            return False
+        if not self._deploy_current_experiment_card():
+            log(C.SR003, reason="buttons", idx=card_index)
+            return False
+        log(C.SR002, idx=card_index)
+        return True
+
+    def _switch_next_experiment_after_start_click_fail(self):
+        """重新部署后首次点击仍失败：ESC 退出并顺延到下一实验卡片。"""
+        log(C.EX005, reason="start_fail", idx=self._experiment_card_index + 1)
+        self.state.set_status("开始按钮失败：切换下一实验")
+        self._experiment_card_index += 1
+        self._save_card_index_to_config(self._experiment_card_index)
+        self._experiment_switch_bootstrapped = False
+        self._awaiting_first_start_after_redeploy = False
+        self._start_click_consecutive_failures = 0
+        self._start_click_recovery_marked = False
+        self.actions.reset_dynamic_learned_regions()
+        self._press_key("esc")
+        sleep(1.0)
+        self.actions.press_experiment_switch_hotkey()
+        sleep(1.0)
+        self._experiment_panel_preopened = True
+
+    def _move_mouse_to_safe_point_after_start(self):
+        x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
+        pyautogui.moveTo(x, y)
+        sleep(0.2)
+
+    def _click_start_until_confirmed(self, experiment_switch_enabled=False, log_prefix=""):
+        """
+        循环点击开始按钮直至模板消失确认成功。
+
+        实验切换模式下：
+        - 连续 START_CLICK_FAIL_RECOVERY_THRESHOLD 次未确认 → ESC 并重部署当前实验（回合计数不变），记录失败标记；
+        - 重部署后首次点击仍失败 → ESC 并切换下一实验。
+
+        返回 True=成功；False=中断；\"rebootstrap\"=已切换下一实验，上层应 return 以重走 bootstrap。
+        """
+        while self.actions.ready_to_start():
+            if self._wait_if_paused_or_interrupted():
+                return False
+            clicked = self.actions.start()
+            if clicked:
+                self._start_click_consecutive_failures = 0
+                self._awaiting_first_start_after_redeploy = False
+                self._start_click_recovery_marked = False
+                label = f"{log_prefix}点击开始" if log_prefix else "点击开始"
+                self.state.log(label.strip())
+                self._move_mouse_to_safe_point_after_start()
+                return True
+
+            self._start_click_consecutive_failures += 1
+            fail_label = f"{log_prefix}开始按钮点击未确认，重试" if log_prefix else "开始按钮点击未确认，重试"
+            self.state.log(fail_label.strip())
+
+            if experiment_switch_enabled:
+                if self._awaiting_first_start_after_redeploy:
+                    self._switch_next_experiment_after_start_click_fail()
+                    return "rebootstrap"
+                if self._start_click_consecutive_failures >= START_CLICK_FAIL_RECOVERY_THRESHOLD:
+                    self._runtime_start_click_recovery_count += 1
+                    self._start_click_recovery_marked = True
+                    if not self._redeploy_same_experiment_after_start_fail():
+                        log(C.SR003, reason="redeploy_fail_switch")
+                        self._switch_next_experiment_after_start_click_fail()
+                        return "rebootstrap"
+                    self._start_click_consecutive_failures = 0
+                    self._awaiting_first_start_after_redeploy = True
+                    while not self.actions.ready_to_start():
+                        if self._wait_if_paused_or_interrupted():
+                            return False
+                        sleep(0.2)
+                    continue
+
+            sleep(0.12)
+        return True
 
     def _run_experiment_switch_bootstrap(self):
         """
@@ -474,10 +676,7 @@ class AutomationEngine:
                 # 【实验已用尽、12张卡片已全部尝试完毕。
                 if self._current_body_part_index != 5:
                     self.state.set_status("实验已用尽：切换到身体部位5号")
-                    print(
-                        f"\n[实验已用尽] 12张卡片已全部尝试，"
-                        f"切换身体部位 {self._current_body_part_index}号→5号，重置实验点位为1。"
-                    )
+                    log(C.EX005, reason="exhausted_body", from_idx=self._current_body_part_index, to=5)
                     self.actions.click_body_part(2)
                     sleep(0.5)
                     self.actions.click_body_part(5)
@@ -488,23 +687,18 @@ class AutomationEngine:
                 # 5号身体部位：12 张卡仍全部无法确认身体部位条消失，视为本流程结束。
                 self.state.manual_pause = True
                 self.state.set_status("全部实验已完成，程序暂停")
-                print(
-                    "\n[实验已用尽] 身体部位5号上 12 张卡片仍无法确认「身体部位条已消失」。"
-                    "若仍有可用实验，请检查「身体部位」模板标定或重试。"
-                )
+                log(C.EX004, reason="all_done", ws=5)
                 return False
 
             self._save_card_index_to_config(self._experiment_card_index)
             # 流程.md 第3条：进入【尝试选定实验】后延时 1s 再点击实验卡片。
             sleep(1.0)
-            print(f"\n[实验切换] 尝试选定实验：准备点击实验卡片索引={self._experiment_card_index}。")
+            log(C.EX002, idx=self._experiment_card_index)
             clicked = self.actions.click_experiment_card(self._experiment_card_index)
             if not clicked:
                 self.state.manual_pause = True
                 self.state.set_status("实验切换失败: 实验卡片点位不可用")
-                print(
-                    f"\n[实验切换] 已暂停：实验卡片点位不可用，当前索引={self._experiment_card_index}。"
-                )
+                log(C.EX002, reason="no_point", idx=self._experiment_card_index)
                 return False
 
             # 流程.md 第3条：点击后检测「身体部位条是否消失」（实验选定后该条通常收起/不可见）。
@@ -512,16 +706,11 @@ class AutomationEngine:
             sel_confirm_timeout_sec = 3.5
             body_part_hidden = self.actions.wait_until_body_part_switch_hidden(timeout_sec=sel_confirm_timeout_sec)
             if not body_part_hidden:
-                print(
-                    "\n[实验切换] 首次未在超时内检测到身体部位条消失，"
-                    "将重开实验面板并再次点击同一张卡片（避免界面延迟/模板瞬时未匹配误判为已用尽）。"
-                )
+                log(C.EX002, reason="retry_panel", idx=self._experiment_card_index)
                 if not self._retry_experiment_panel_and_click_same_card(self._experiment_card_index):
                     self.state.manual_pause = True
                     self.state.set_status("实验切换失败: 实验卡片点位不可用")
-                    print(
-                        f"\n[实验切换] 已暂停：重试时实验卡片点位不可用，当前索引={self._experiment_card_index}。"
-                    )
+                    log(C.EX002, reason="retry_fail", idx=self._experiment_card_index)
                     return False
                 body_part_hidden = self.actions.wait_until_body_part_switch_hidden(timeout_sec=sel_confirm_timeout_sec)
 
@@ -529,9 +718,12 @@ class AutomationEngine:
                 # 两次尝试后身体部位条仍在：多数为当前卡槽不可用，或「身体部位」模板/阈值需检查。
                 if self._current_body_part_index != 5:
                     self.state.set_status("实验已用尽：切换到身体部位5号")
-                    print(
-                        f"\n[实验已用尽] 卡片{self._experiment_card_index}号经两次检测身体部位条仍未消失，"
-                        f"将假定当前身体部位该槽不可用，切换身体部位 {self._current_body_part_index}号→5号，重置实验点位为1。"
+                    log(
+                        C.EX005,
+                        reason="card_body",
+                        idx=self._experiment_card_index,
+                        from_idx=self._current_body_part_index,
+                        to=5,
                     )
                     self.actions.click_body_part(2)
                     sleep(0.5)
@@ -543,10 +735,7 @@ class AutomationEngine:
                 # 5号身体部位仍失败：可能真已无可用实验，也可能是身体部位模板未稳定匹配。
                 self.state.manual_pause = True
                 self.state.set_status("全部实验已完成，程序暂停")
-                print(
-                    "\n[实验已用尽] 在身体部位5号上仍无法确认身体部位条消失。"
-                    "若你确认仍有可用实验，请检查「身体部位」模板标定与匹配阈值，或适当提高游戏帧率/关闭遮挡。"
-                )
+                log(C.EX004, reason="body5_fail")
                 return False
 
             # ── 流程.md 第4条：【尝试部署实验】──
@@ -557,20 +746,17 @@ class AutomationEngine:
             if both_ready:
                 # 部署成功后先等待 1s，再进入正常运行阶段。
                 sleep(1.0)
+                self.actions.reset_dynamic_learned_regions()
                 self._experiment_switch_bootstrapped = True
                 self._experiment_cycle_count = 0
                 self.state.set_status("实验切换完成")
-                print(f"\n[实验切换] 部署成功：实验卡片索引={self._experiment_card_index}。")
+                log(C.EX003, idx=self._experiment_card_index)
                 return True
             if start_seen:
-                # 开始按钮出现后，必须再满足“恢复体力按钮存在”才算部署成功。
-                # 规则：若“恢复体力按钮”不存在，直接判定部署失败并切换下一实验，不做移动视角重试。
-                print(
-                    f"\n[实验切换] 部署失败：索引={self._experiment_card_index}，"
-                    "原因=恢复体力按钮不存在，直接进入【切换下一实验】。"
-                )
+                log(C.EX004, reason="no_recover", idx=self._experiment_card_index)
                 self._experiment_card_index += 1
-                pyautogui.press("esc")
+                self.actions.reset_dynamic_learned_regions()
+                self._press_key("esc")
                 sleep(1.0)
                 self.actions.press_experiment_switch_hotkey()
                 sleep(1.0)
@@ -582,36 +768,30 @@ class AutomationEngine:
                     return False
                 if self._wait_if_paused_or_interrupted():
                     return False
-                print("\n[移动视角部署] 开始：5 秒内连续移动视角并左键...")
-                self.state.set_status("移动视角部署（5秒连续）")
-                mv_start_seen, mv_both = self.actions.move_camera_burst_deploy_check(duration_sec=5.0)
+                log(C.EX007)
+                self.state.set_status("移动视角部署（平滑转圈）")
+                mv_start_seen, mv_both = self.actions.move_camera_burst_deploy_check()
                 if mv_both:
-                    print("\n[移动视角部署] 成功：开始按钮与恢复体力按钮均通过。")
+                    log(C.EX008, reason="ok")
                     sleep(1.0)
+                    self.actions.reset_dynamic_learned_regions()
                     self._experiment_switch_bootstrapped = True
                     self._experiment_cycle_count = 0
                     self.state.set_status("实验切换完成")
-                    print(f"\n[实验切换] 部署成功：实验卡片索引={self._experiment_card_index}。")
+                    log(C.EX003, idx=self._experiment_card_index)
                     return True
                 if mv_start_seen:
-                    # 规则：恢复体力按钮不存在 -> 直接切换下一实验。
-                    print(
-                        "\n[移动视角部署] 失败：开始按钮已出现但恢复体力按钮不存在，"
-                        "直接进入【切换下一实验】。"
-                    )
+                    log(C.EX008, reason="no_recover")
                     self._experiment_card_index += 1
-                    pyautogui.press("esc")
+                    self._press_key("esc")
                     sleep(1.0)
                     self.actions.press_experiment_switch_hotkey()
                     sleep(1.0)
                     continue
                 # 5 秒内始终未出现开始按钮（或未达到双条件）→ 【切换下一实验】。
-                print(
-                    f"\n[实验切换] 部署全部失败：索引={self._experiment_card_index}，"
-                    "顺延到下一卡片并进入【切换下一实验】。"
-                )
+                log(C.EX004, reason="all_fail", idx=self._experiment_card_index)
                 self._experiment_card_index += 1
-                pyautogui.press("esc")
+                self._press_key("esc")
                 sleep(1.0)
                 self.actions.press_experiment_switch_hotkey()
                 sleep(1.0)
@@ -641,7 +821,11 @@ class AutomationEngine:
             for _ in range(batch):
                 if (not self._scroll_enabled) or self.state.manual_pause or self._scroll_stop_event.is_set():
                     break
-                pyautogui.scroll(amount)
+                inp = self.actions._inp()
+                if inp is not None:
+                    inp.scroll(amount)
+                else:
+                    pyautogui.scroll(amount)
 
     def _start_scroll_worker(self):
         if self._scroll_thread is None or (not self._scroll_thread.is_alive()):
@@ -673,13 +857,13 @@ class AutomationEngine:
         """
         # 标定层期间保持暂停，避免误恢复导致鼠标继续被脚本接管。
         if str(self.state.current_status).startswith("标定中"):
-            print("\n[F1] 当前处于标定模式，忽略恢复请求。")
+            log(C.HK001, reason="calibration")
             return
 
         self.state.manual_pause = not self.state.manual_pause
         if self.state.manual_pause:
             self.state.set_status("F1紧急暂停")
-            print("\n[F1] 已暂停自动流程。")
+            log(C.HK001, action="pause")
         else:
             # 主线程里收起展开的子页面，避免遮挡游戏区域、影响模板匹配。
             self.state.collapse_subpanels_request = True
@@ -687,10 +871,10 @@ class AutomationEngine:
             # 则恢复状态文案要明确提示“下一步会先切换”，避免用户误判脚本会先继续当前实验。
             if self._f2_pending_switch_after_resume:
                 self.state.set_status("F1恢复运行，准备切换下一实验")
-                print("\n[F1] 已恢复自动流程，将立即切换下一实验。")
+                log(C.HK002, action="resume_switch")
             else:
                 self.state.set_status("F1恢复运行")
-                print("\n[F1] 已恢复自动流程。")
+                log(C.HK002, action="resume")
 
     def _wait_if_paused_or_interrupted(self):
         """
@@ -745,9 +929,15 @@ class AutomationEngine:
             self.state.set_status("自动补充体力：已检测到体力不足，但未匹配到独立补充按钮")
             return
         self.state.set_status("自动补充体力：点击独立补充按钮并确认凝胶")
-        pyautogui.moveTo(supplement_pos[0], supplement_pos[1])
-        sleep(0.12)
-        pyautogui.leftClick()
+        inp = self._inp()
+        if inp is not None:
+            inp.move_to(supplement_pos[0], supplement_pos[1])
+            sleep(0.12)
+            inp.left_click()
+        else:
+            pyautogui.moveTo(supplement_pos[0], supplement_pos[1])
+            sleep(0.12)
+            pyautogui.leftClick()
         t_end = time() + 1.0
         while time() < t_end:
             if self._wait_if_paused_or_interrupted():
@@ -759,9 +949,14 @@ class AutomationEngine:
         nx = (float(rect[0]) + float(rect[2])) / 2.0
         ny = (float(rect[1]) + float(rect[3])) / 2.0
         x, y = self.window_service.denormalize_point([nx, ny])
-        pyautogui.moveTo(x, y)
-        sleep(0.08)
-        pyautogui.leftClick()
+        if inp is not None:
+            inp.move_to(x, y)
+            sleep(0.08)
+            inp.left_click()
+        else:
+            pyautogui.moveTo(x, y)
+            sleep(0.08)
+            pyautogui.leftClick()
 
     def _wait_until_start_visible_again(self, log_message="等待开始"):
         """
@@ -789,11 +984,11 @@ class AutomationEngine:
             # 未开启实验切换时不保留待切换标记，避免恢复后触发无意义分支。
             self._f2_pending_switch_after_resume = False
             self.state.set_status("F2已暂停（实验切换未开启）")
-            print("\n[F2] 已暂停；当前未开启实验切换，恢复后不会执行切换。")
+            log(C.HK003, reason="no_exp_switch")
             return
         self._f2_pending_switch_after_resume = True
         self.state.set_status("F2已暂停，恢复后切换下一实验")
-        print("\n[F2] 已暂停，恢复后将立即切换下一实验。")
+        log(C.HK003, action="pause_switch")
 
     def _toggle_like_force_next_by_f3(self):
         """
@@ -808,7 +1003,7 @@ class AutomationEngine:
                 self.config_store.data["like_force_next"] = False
                 self.config_store.save()
             self.state.set_status("F3忽略：点赞功能未开启")
-            print("\n[F3] 已忽略：当前未开启点赞功能。")
+            log(C.HK004, reason="disabled")
             return
 
         next_value = not bool(self.config_store.data.get("like_force_next", False))
@@ -816,10 +1011,10 @@ class AutomationEngine:
         self.config_store.save()
         if next_value:
             self.state.set_status("F3已开启：结束后强制点赞")
-            print("\n[F3] 已开启：再来一次成功后强制点赞（一次性）。")
+            log(C.HK004, action="on")
         else:
             self.state.set_status("F3已关闭：结束后强制点赞")
-            print("\n[F3] 已关闭：再来一次成功后强制点赞。")
+            log(C.HK004, action="off")
 
     def _toggle_all_calibration_overlay_by_f12(self):
         """
@@ -833,10 +1028,10 @@ class AutomationEngine:
             self.state.show_all_calibration_overlay = False
             self.state.open_calibration_overlay_selector = True
             self.state.calibration_overlay_phase = "await_selection"
-            print("\n[F12] 请选择要显示的标定项。")
+            log(C.HK005, action="select")
             return
         if phase == "await_selection":
-            print("\n[F12] 等待完成标定项选择。")
+            log(C.HK005, action="await")
             return
         if phase == "ready_to_show":
             selected = list(getattr(self.state, "calibration_overlay_selected_keys", []))
@@ -844,24 +1039,24 @@ class AutomationEngine:
                 # 防御：无选择时回到第一步
                 self.state.open_calibration_overlay_selector = True
                 self.state.calibration_overlay_phase = "await_selection"
-                print("\n[F12] 未选择任何标定项，请先选择。")
+                log(C.HK005, reason="empty")
                 return
             self.state.show_all_calibration_overlay = True
             self.state.calibration_overlay_phase = "showing"
-            print("\n[F12] 已显示选定标定叠加层。")
+            log(C.HK005, action="show")
             return
         if phase == "showing":
             self.state.show_all_calibration_overlay = False
             self.state.calibration_overlay_phase = "idle"
             self.state.calibration_overlay_selected_keys = []
-            print("\n[F12] 已收起标定叠加层。")
+            log(C.HK005, action="hide")
             return
         # 异常状态兜底
         self.state.show_all_calibration_overlay = False
         self.state.open_calibration_overlay_selector = False
         self.state.calibration_overlay_phase = "idle"
         self.state.calibration_overlay_selected_keys = []
-        print("\n[F12] 调试状态已重置。")
+        log(C.HK005, action="reset")
 
     def _replay_pull_new_experiment_scroll_by_f11(self):
         """F11 调试：随时重播“拉出新实验滚动”标定动作。"""
@@ -896,19 +1091,15 @@ class AutomationEngine:
                 return
             if not still:
                 if round_idx > 0:
-                    print("\n[F2切换] 「恢复体力按钮」已消失，视为已回到大厅侧。")
+                    log(C.HK003, reason="recover_hidden")
                 return
             if round_idx == 0:
-                print(
-                    "\n[F2切换] 首次 ESC 后仍可见「恢复体力按钮」，将间歇按 ESC 直至其消失。"
-                )
+                log(C.HK003, reason="esc_loop")
             self.state.set_status("F2切换：ESC 返回中（恢复体力按钮仍可见）")
-            pyautogui.press("esc")
+            self._press_key("esc")
             sleep(0.38)
 
-        print(
-            f"\n[F2切换] 警告：已额外 ESC {max_extra_esc} 次后「恢复体力按钮」仍可见，继续后续切换。"
-        )
+        log(C.HK003, reason="esc_max", n=max_extra_esc)
 
     def _switch_next_experiment_after_f2_resume(self):
         """
@@ -922,8 +1113,9 @@ class AutomationEngine:
         self._experiment_cycle_count = 0
         self._experiment_card_index += 1
         self._experiment_switch_bootstrapped = False
+        self.actions.reset_dynamic_learned_regions()
         self.state.set_status("F2恢复后：切换下一实验")
-        pyautogui.press("esc")
+        self._press_key("esc")
         # 首次 ESC 后若仍卡在带「恢复体力按钮」的界面，继续 ESC 直到回到大厅认知态。
         self._esc_until_recover_stamina_button_hidden()
         sleep(1.0)
@@ -938,83 +1130,82 @@ class AutomationEngine:
         延迟 1s 后按 E 打开实验面板；
         最后再等待 1s，交由后续流程进入“尝试选定实验”阶段。
         """
-        pyautogui.press("esc")
+        self._press_key("esc")
         sleep(1.0)
         self.actions.press_experiment_switch_hotkey()
         sleep(1.0)
+
+    def _special_action_visible_for_stall(self):
+        """特殊动作按钮是否可见（模板或变红），用于女条停滞武装/恢复。"""
+        if self.actions.is_special_action_button_present():
+            return True
+        return self.actions.is_special_action_button_red(threshold=0.45)
 
     def _female_bar_stall_monitor_loop(self):
         """
         流程.md 第8条：正常运行时独立线程监测女进度条是否停滞。
         每 ~0.3s 采样一次 b1；若连续 FEMALE_BAR_STALL_NO_INCREASE_SECONDS 秒内无有效增长则置位停滞标志。
         """
-        # 放宽“有增长”的判定门槛：更小的增长也视为有效增长，降低误判停滞概率。
-        epsilon = 0.003
-        baseline_b1 = None
-        baseline_time = None
+        epsilon = FEMALE_BAR_STALL_GROWTH_EPSILON
+        peak_b1 = None
+        stall_since = None
         while not self._female_bar_monitor_stop.is_set():
             if not self._female_bar_monitor_active:
-                baseline_b1 = None
-                baseline_time = None
+                peak_b1 = None
+                stall_since = None
                 sleep(0.1)
                 continue
             if self.state.manual_pause:
                 # 暂停中记下标记，恢复后给宽限期，避免 F1 恢复后立刻误判停滞。
                 self._female_bar_monitor_was_paused = True
-                baseline_b1 = None
-                baseline_time = None
+                peak_b1 = None
+                stall_since = None
                 sleep(0.1)
                 continue
             if self._female_bar_monitor_was_paused:
                 self._female_bar_monitor_was_paused = False
                 self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
-            # 额外条件：特殊动作触发后暂停停滞判断；
-            # 直到“特殊动作按键重新出现”后立即恢复。
             now = time()
-            if now < self._female_bar_stall_suspend_until or self._female_bar_stall_wait_special_reappear:
-                baseline_b1 = None
-                baseline_time = None
+            if now < self._female_bar_stall_suspend_until:
+                self._female_bar_stall_in_suspend = True
+                peak_b1 = None
+                stall_since = None
                 sleep(0.1)
                 continue
-            # 开局：开始按钮已点后，须先模板匹配到特殊动作按钮，再启动停滞计时（存在≠可触发红态）。
+            if self._female_bar_stall_in_suspend:
+                self._female_bar_stall_in_suspend = False
+                self._female_bar_stall_grace_until = now + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
+                log(C.SA008, reason="suspend_done", grace=FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC)
+            # 开局：须检测到特殊动作按钮（模板或变红）后再启动停滞计时。
             if self._female_bar_stall_wait_special_visible_after_start:
                 try:
-                    if self.actions.is_special_action_button_present():
+                    if self._special_action_visible_for_stall():
                         self._female_bar_stall_wait_special_visible_after_start = False
                         self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
-                        print(
-                            f"\n[女进度条监测] 已检测到特殊动作按钮（模板），启动女进度条停滞检测；"
-                            f"宽限 {FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC:.0f}s 内不因未增长判停滞。"
-                        )
+                        log(C.FB001, grace=FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC)
                     else:
-                        baseline_b1 = None
-                        baseline_time = None
+                        peak_b1 = None
+                        stall_since = None
                         sleep(0.1)
                         continue
                 except Exception:
                     sleep(0.1)
                     continue
             try:
-                screen = self.vision_service.capture_screen()
-                b1, _ = self.vision_service.detect_bars(screen)
+                b1, _ = self._get_bar_ratios()
             except Exception:
                 sleep(0.3)
                 continue
-            if baseline_b1 is None:
-                baseline_b1 = b1
-                baseline_time = now
-            elif b1 > baseline_b1 + epsilon:
-                # 有增长：刷新基线
-                baseline_b1 = b1
-                baseline_time = now
+            if peak_b1 is None:
+                peak_b1 = b1
+                stall_since = now
+            elif b1 > peak_b1 + epsilon:
+                peak_b1 = b1
+                stall_since = now
             elif now < self._female_bar_stall_grace_until:
-                # 宽限期内：不判停滞；滑动刷新基线，避免宽限刚结束就因旧计时触发。
-                baseline_b1 = b1
-                baseline_time = now
-            elif now - baseline_time >= FEMALE_BAR_STALL_NO_INCREASE_SECONDS:
-                print(
-                    f"\n[女进度条监测] {FEMALE_BAR_STALL_NO_INCREASE_SECONDS:.0f}s 内未增加（b1={b1:.4f}），触发停滞切换。"
-                )
+                stall_since = now
+            elif stall_since is not None and now - stall_since >= FEMALE_BAR_STALL_NO_INCREASE_SECONDS:
+                log(C.FB002, b1=b1, peak=peak_b1, sec=FEMALE_BAR_STALL_NO_INCREASE_SECONDS)
                 self._female_bar_stall_flag = True
                 self._female_bar_monitor_active = False
             sleep(0.3)
@@ -1038,64 +1229,307 @@ class AutomationEngine:
             self._female_bar_monitor_thread.join(timeout=1.0)
         self._female_bar_monitor_thread = None
 
+    def _reset_special_action_rise_gate(self):
+        """清空「等敏感条上升」门控，允许新一轮判红触发。"""
+        self._special_action_wait_sensitive_rise = False
+        self._special_action_sensitive_baseline = None
+        self._special_action_sensitive_trough = None
+        self._special_action_sens_ema = None
+        self._special_action_rise_wait_since = 0.0
+        self._special_action_post_rise_until = 0.0
+
+    def _special_action_sens_ema_alpha(self):
+        try:
+            return float(
+                self.config_store.data.get(
+                    "special_action_sens_ema_alpha", SPECIAL_ACTION_SENS_EMA_ALPHA
+                )
+            )
+        except Exception:
+            return SPECIAL_ACTION_SENS_EMA_ALPHA
+
+    def _special_action_rise_stall_sec(self):
+        try:
+            return float(
+                self.config_store.data.get(
+                    "special_action_rise_stall_sec", SPECIAL_ACTION_RISE_STALL_SEC
+                )
+            )
+        except Exception:
+            return SPECIAL_ACTION_RISE_STALL_SEC
+
+    def _special_action_phase_warmup_sec(self):
+        try:
+            return float(
+                self.config_store.data.get(
+                    "special_action_phase_warmup_sec", SPECIAL_ACTION_PHASE_WARMUP_SEC
+                )
+            )
+        except Exception:
+            return SPECIAL_ACTION_PHASE_WARMUP_SEC
+
+    def _update_special_action_sens_ema(self, ratio_raw):
+        """敏感条 EMA，抑制单帧跳变误触发升幅门控。"""
+        if ratio_raw is None:
+            return self._special_action_sens_ema
+        alpha = self._special_action_sens_ema_alpha()
+        if self._special_action_sens_ema is None:
+            self._special_action_sens_ema = ratio_raw
+        else:
+            self._special_action_sens_ema = (
+                alpha * ratio_raw + (1.0 - alpha) * self._special_action_sens_ema
+            )
+        return self._special_action_sens_ema
+
+    def _log_special_action_diag(self, code, reason, interval_sec=1.0, **fields):
+        now = time()
+        key = (code, reason)
+        last = self._special_action_diag_last_ts.get(key, 0.0)
+        if now - last < interval_sec:
+            return
+        self._special_action_diag_last_ts[key] = now
+        log(code, reason=reason, **fields)
+
+    def _special_action_sensitive_max(self):
+        """敏感条达到该填充率时不再触发特殊动作（config 可覆盖）。"""
+        try:
+            return float(
+                self.config_store.data.get("special_action_sensitive_max", SPECIAL_ACTION_SENSITIVE_MAX)
+            )
+        except Exception:
+            return SPECIAL_ACTION_SENSITIVE_MAX
+
+    def _special_action_rise_min(self):
+        try:
+            return float(
+                self.config_store.data.get(
+                    "special_action_sensitive_rise_min", SPECIAL_ACTION_SENSITIVE_RISE_MIN
+                )
+            )
+        except Exception:
+            return SPECIAL_ACTION_SENSITIVE_RISE_MIN
+
+    def _special_action_post_rise_delay(self):
+        try:
+            return float(
+                self.config_store.data.get(
+                    "special_action_post_rise_delay_sec", SPECIAL_ACTION_POST_RISE_DELAY_SEC
+                )
+            )
+        except Exception:
+            return SPECIAL_ACTION_POST_RISE_DELAY_SEC
+
+    def _special_action_rise_gate_allows_trigger(self):
+        """
+        按「1」后的上升门控（详细流程逻辑 §3）：
+        - 未在等待上升：允许进入触发判定；
+        - 等待中：EMA 相对「触发后谷底」上升 + post-rise 延时（不要求按钮仍红）；
+        - 长时间无上升：超时重置门控，避免 sens 持平导致永久漏触发；
+        - 敏感条已满：重置门控（满则不再触发）；
+        - 门控解除后由 evaluate_special_action_trigger 再判红触发。
+        """
+        if not self._special_action_wait_sensitive_rise:
+            return True
+
+        sensitive_max = self._special_action_sensitive_max()
+        ratio_raw = self.actions.get_sensitive_progress_bar_ratio()
+        ratio = self._update_special_action_sens_ema(ratio_raw)
+        baseline = self._special_action_sensitive_baseline
+        rise_min = self._special_action_rise_min()
+        now_ts = time()
+
+        if ratio is not None and ratio >= sensitive_max:
+            self._reset_special_action_rise_gate()
+            self._log_special_action_diag(C.SA010, "gate_sens_high", sens=ratio, max=sensitive_max)
+            return False
+
+        # 已检测到上升：仅等待 post-rise 倒计时（按钮变灰不阻断）。
+        if self._special_action_post_rise_until > 0.0:
+            if now_ts >= self._special_action_post_rise_until:
+                self._reset_special_action_rise_gate()
+                return True
+            self._log_special_action_diag(
+                C.SA010,
+                "gate_post_wait",
+                sens=ratio,
+                base=baseline,
+                trough=self._special_action_sensitive_trough,
+                left=max(0.0, self._special_action_post_rise_until - now_ts),
+            )
+            return False
+
+        if ratio is not None:
+            if self._special_action_sensitive_trough is None:
+                self._special_action_sensitive_trough = ratio
+            else:
+                self._special_action_sensitive_trough = min(
+                    self._special_action_sensitive_trough, ratio
+                )
+
+        trough = self._special_action_sensitive_trough
+        stall_sec = self._special_action_rise_stall_sec()
+        if (
+            self._special_action_rise_wait_since > 0.0
+            and stall_sec > 0.0
+            and (now_ts - self._special_action_rise_wait_since) >= stall_sec
+        ):
+            self._reset_special_action_rise_gate()
+            self._log_special_action_diag(
+                C.SA010,
+                "gate_stall_reset",
+                sens=ratio,
+                base=baseline,
+                trough=trough,
+                stall=stall_sec,
+            )
+            return True
+
+        # 等待敏感条相对触发后谷底上升（EMA，不要求按钮仍红）。
+        if ratio is not None and trough is not None and ratio >= trough + rise_min:
+            self._special_action_post_rise_until = now_ts + self._special_action_post_rise_delay()
+            self._log_special_action_diag(
+                C.SA010,
+                "gate_rise_seen",
+                sens=ratio,
+                base=baseline,
+                trough=trough,
+                rise=rise_min,
+            )
+            return False
+
+        self._log_special_action_diag(
+            C.SA010,
+            "gate_wait_rise",
+            sens=ratio,
+            base=baseline,
+            trough=trough,
+            rise=rise_min,
+        )
+        return False
+
+    def _special_action_timing(self):
+        """读取特殊动作线程的轮询/按键/节流参数（config 可覆盖模块默认值）。"""
+        cfg = self.config_store.data
+        try:
+            poll = float(cfg.get("special_action_poll_interval_sec", SPECIAL_ACTION_POLL_INTERVAL_SEC))
+        except Exception:
+            poll = SPECIAL_ACTION_POLL_INTERVAL_SEC
+        try:
+            press_delay = float(cfg.get("special_action_press_delay_sec", SPECIAL_ACTION_PRESS_DELAY_SEC))
+        except Exception:
+            press_delay = SPECIAL_ACTION_PRESS_DELAY_SEC
+        try:
+            cooldown = float(cfg.get("special_action_trigger_cooldown_sec", SPECIAL_ACTION_TRIGGER_COOLDOWN_SEC))
+        except Exception:
+            cooldown = SPECIAL_ACTION_TRIGGER_COOLDOWN_SEC
+        return (
+            max(0.02, poll),
+            max(0.0, press_delay),
+            max(0.15, cooldown),
+        )
+
     def _special_action_monitor_loop(self):
         """
         特殊动作线程：
         仅在“点击开始后~点击高潮前”激活，持续循环判断并触发主键盘“1”。
         """
+        poll_sec, press_delay_sec, cooldown_sec = self._special_action_timing()
+        idle_sleep = poll_sec
         while not self._special_action_monitor_stop.is_set():
             if (not self._special_action_monitor_active) or self.state.manual_pause:
-                sleep(0.1)
+                sleep(idle_sleep)
                 continue
 
-            # 按「1」后：延迟 1s 起算，任意一次模板匹配即视为重新出现（与敏感条采样无关）。
-            if self._female_bar_stall_wait_special_reappear:
-                if self._special_action_should_abort():
-                    sleep(0.1)
-                    continue
-                if time() < self._female_bar_stall_reappear_earliest_ts:
-                    sleep(0.1)
-                    continue
-                if self.actions.is_special_action_button_present():
-                    self._female_bar_stall_wait_special_reappear = False
-                    self._female_bar_stall_suspend_until = 0.0
-                    self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
-                    print(
-                        f"\n[特殊动作] 延迟 {SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC:.0f}s 后检测到特殊按钮（模板），"
-                        f"启动女进度条停滞检测；宽限 {FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC:.0f}s 内不因未增长判停滞。"
+            now_ts = time()
+            # 刚按完「1」的短冷却内不再重复触发，避免连按。
+            if (now_ts - self._special_action_last_trigger_ts) < SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC:
+                self._log_special_action_diag(
+                    C.SA009,
+                    "reappear_wait",
+                    left=SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC
+                    - (now_ts - self._special_action_last_trigger_ts),
+                )
+                sleep(idle_sleep)
+                continue
+
+            if not self._special_action_rise_gate_allows_trigger():
+                sleep(idle_sleep)
+                continue
+
+            warmup_sec = self._special_action_phase_warmup_sec()
+            if (
+                self._special_action_phase_started_at > 0.0
+                and warmup_sec > 0.0
+                and (now_ts - self._special_action_phase_started_at) < warmup_sec
+            ):
+                sens_probe = self.actions.get_sensitive_progress_bar_ratio()
+                if sens_probe is None or sens_probe < 0.06:
+                    self._log_special_action_diag(
+                        C.SA009,
+                        "phase_warmup",
+                        left=warmup_sec - (now_ts - self._special_action_phase_started_at),
+                        sens=sens_probe,
                     )
-                sleep(0.1)
-                continue
-
-            sensitive_ratio = self.actions.get_sensitive_progress_bar_ratio()
-            if sensitive_ratio is None:
-                sleep(0.1)
-                continue
-
-            # 条件：敏感进度条<80% 且 特殊动作按钮红色占比>60%。
-            # 与点击逻辑保持“循环判断”，条件持续满足时可重复触发“1”。
-            if sensitive_ratio < 0.80 and self.actions.is_special_action_button_red(threshold=0.60):
-                if self._special_action_should_abort():
-                    sleep(0.1)
+                    sleep(idle_sleep)
                     continue
-                # 触发节流：最多约每 0.8s 触发一次，避免按键洪泛。
-                now_ts = time()
-                if (now_ts - self._special_action_last_trigger_ts) >= 0.8:
-                    if self.actions.press_main_keyboard_one_after_delay(
-                        delay_sec=0.2, abort_check=self._special_action_should_abort
-                    ):
-                        self._special_action_last_trigger_ts = now_ts
-                        # 每次触发“1”后，先暂停停滞检测并等待“特殊动作按键重新出现”；
-                        # 重新出现后立即恢复女进度条停滞检测。
-                        self._female_bar_stall_flag = False
-                        self._female_bar_stall_suspend_until = 0.0
-                        self._female_bar_stall_wait_special_reappear = True
-                        self._female_bar_stall_reappear_earliest_ts = time() + SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC
-                        print(
-                            f"\n[特殊动作] 已触发“1”：敏感进度条={sensitive_ratio:.3f}，"
-                            f"暂停女进度条停滞检测；{SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC:.0f}s 后任意模板匹配即恢复。"
-                        )
-            sleep(0.1)
+
+            sensitive_max = self._special_action_sensitive_max()
+            ready, sensitive_ratio, detail = self.actions.evaluate_special_action_trigger(
+                sensitive_max=sensitive_max,
+                detail=True,
+            )
+            if not ready:
+                detail = detail or {}
+                reason = detail.get("reason", "not_ready")
+                self._log_special_action_diag(
+                    C.SA009,
+                    reason,
+                    sens=sensitive_ratio,
+                    max=detail.get("max", sensitive_max),
+                    red=detail.get("red"),
+                    th=detail.get("th"),
+                    mode=detail.get("mode"),
+                    x=detail.get("x"),
+                    y=detail.get("y"),
+                    w=detail.get("w"),
+                    h=detail.get("h"),
+                )
+                sleep(idle_sleep)
+                continue
+            if self._special_action_should_abort():
+                self._log_special_action_diag(C.SA009, "abort", sens=sensitive_ratio)
+                sleep(idle_sleep)
+                continue
+            if (now_ts - self._special_action_last_trigger_ts) < cooldown_sec:
+                self._log_special_action_diag(
+                    C.SA009,
+                    "cooldown",
+                    sens=sensitive_ratio,
+                    left=cooldown_sec - (now_ts - self._special_action_last_trigger_ts),
+                )
+                sleep(idle_sleep)
+                continue
+            if self.actions.press_main_keyboard_one_after_delay(
+                delay_sec=press_delay_sec, abort_check=self._special_action_should_abort
+            ):
+                self._special_action_last_trigger_ts = now_ts
+                self._special_action_wait_sensitive_rise = True
+                self._special_action_sensitive_baseline = sensitive_ratio
+                self._special_action_sensitive_trough = sensitive_ratio
+                self._special_action_sens_ema = sensitive_ratio
+                self._special_action_rise_wait_since = now_ts
+                self._special_action_post_rise_until = 0.0
+                self._female_bar_stall_flag = False
+                self._female_bar_stall_suspend_until = now_ts + FEMALE_BAR_STALL_SUSPEND_AFTER_ONE_SEC
+                # 按 1 即说明特殊按钮已可用，确保女条停滞检测已武装。
+                if self._female_bar_stall_wait_special_visible_after_start:
+                    self._female_bar_stall_wait_special_visible_after_start = False
+                    self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
+                    log(C.FB001, grace=FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC, via="sa")
+                rise_min = self._special_action_rise_min()
+                post_delay = self._special_action_post_rise_delay()
+                log(C.SA007, sens=sensitive_ratio, rise=rise_min, post=post_delay)
+            sleep(idle_sleep)
 
     def _start_special_action_monitor(self):
         """启动特殊动作线程（守护线程，生命周期跟随主循环）。"""
@@ -1103,9 +1537,9 @@ class AutomationEngine:
             self._special_action_monitor_stop.clear()
             self._special_action_monitor_active = False
             self._special_action_last_trigger_ts = 0.0
+            self._reset_special_action_rise_gate()
             self._female_bar_stall_suspend_until = 0.0
-            self._female_bar_stall_wait_special_reappear = False
-            self._female_bar_stall_reappear_earliest_ts = 0.0
+            self._female_bar_stall_in_suspend = False
             self._special_action_monitor_thread = threading.Thread(
                 target=self._special_action_monitor_loop, daemon=True
             )
@@ -1137,6 +1571,73 @@ class AutomationEngine:
         self._stall_recovery_rescue_next_index += 1
         return key
 
+    def _finish_wait_timeout_sec(self):
+        try:
+            return float(self.config_store.data.get("finish_wait_timeout_sec", FINISH_WAIT_TIMEOUT_SEC))
+        except Exception:
+            return FINISH_WAIT_TIMEOUT_SEC
+
+    def _finish_wait_esc_max(self):
+        try:
+            return max(1, int(self.config_store.data.get("finish_wait_esc_max", FINISH_WAIT_ESC_MAX)))
+        except Exception:
+            return FINISH_WAIT_ESC_MAX
+
+    def _esc_until_start_or_finish(self, status_msg, log_context="finish_wait"):
+        """循环 ESC 直到出现开始或结束按钮。"""
+        max_esc = self._finish_wait_esc_max()
+        for attempt in range(1, max_esc + 1):
+            if self._wait_if_paused_or_interrupted():
+                return "interrupted"
+            if self.actions.ready_to_start():
+                log(C.FN001, ctx=log_context, reason="start", n=attempt)
+                return "start"
+            if self.actions.ready_to_finish():
+                log(C.FN001, ctx=log_context, reason="finish", n=attempt)
+                return "finish"
+            self.state.set_status(f"{status_msg}（ESC {attempt}/{max_esc}）")
+            log(C.FN001, ctx=log_context, reason="esc", n=attempt, m=max_esc)
+            self._press_key("esc")
+            sleep(0.35)
+            poll_until = monotonic() + 2.0
+            while monotonic() < poll_until:
+                if self._wait_if_paused_or_interrupted():
+                    return "interrupted"
+                if self.actions.ready_to_start():
+                    log(C.FN001, ctx=log_context, reason="start", n=attempt)
+                    return "start"
+                if self.actions.ready_to_finish():
+                    log(C.FN001, ctx=log_context, reason="finish", n=attempt)
+                    return "finish"
+                sleep(0.08)
+        log(C.FN001, ctx=log_context, reason="esc_max", m=max_esc)
+        return None
+
+    def _wait_for_finish_button_with_esc_recovery(self):
+        """
+        等待「再来一次/结束」按钮出现；超时则 ESC 直到看到开始或结束按钮。
+        返回 finish / start / interrupted；esc_max 后仍无界面则继续等待下一轮超时。
+        """
+        timeout = self._finish_wait_timeout_sec()
+        deadline = monotonic() + timeout
+        while not self.actions.ready_to_finish():
+            if self._wait_if_paused_or_interrupted():
+                return "interrupted"
+            if monotonic() >= deadline:
+                log(C.FN001, ctx="finish_wait", reason="timeout", sec=timeout)
+                self.state.log("等待结束超时，ESC 返回")
+                result = self._esc_until_start_or_finish(
+                    status_msg="等待结束超时",
+                    log_context="finish_wait",
+                )
+                if result in ("interrupted", "start", "finish"):
+                    return result
+                deadline = monotonic() + timeout
+                continue
+            self.state.log("等待结束")
+            self.actions.wait(0.2)
+        return "finish"
+
     def _wait_stall_recovery_surface(self, timeout_sec=3.0, poll_interval_sec=0.10):
         deadline = monotonic() + max(0.2, float(timeout_sec))
         while monotonic() < deadline:
@@ -1157,8 +1658,8 @@ class AutomationEngine:
 
         for attempt in range(1, esc_attempts + 1):
             self.state.set_status(f"女进度条停滞：ESC恢复尝试 {attempt}/{esc_attempts}")
-            print(f"\n[女进度条停滞] ESC恢复尝试 {attempt}/{esc_attempts}，等待开始/结束按钮。")
-            pyautogui.press("esc")
+            log(C.FB003, n=attempt, m=esc_attempts)
+            self._press_key("esc")
             surface = self._wait_stall_recovery_surface(timeout_sec=3.0)
             if surface in ("start", "finish", "interrupted"):
                 return surface
@@ -1170,11 +1671,8 @@ class AutomationEngine:
         for rescue_attempt in range(1, len(keys) + 1):
             key = self._next_stall_recovery_rescue_key()
             self.state.set_status(f"女进度条停滞：ESC失败，尝试按 {key.upper()}")
-            print(
-                f"\n[女进度条停滞] {esc_attempts} 次 ESC 后仍未出现开始/结束按钮，"
-                f"尝试按 {key.upper()} 释放卡死态（{rescue_attempt}/{len(keys)}）。"
-            )
-            pyautogui.press(key)
+            log(C.FB003, n=rescue_attempt, m=len(keys), key=key)
+            self._press_key(key)
             surface = self._wait_stall_recovery_surface(timeout_sec=3.0)
             if surface in ("start", "finish", "interrupted"):
                 return surface
@@ -1211,7 +1709,7 @@ class AutomationEngine:
            - 两者占比都为 0（视为相等）；
            - 女进度条 > 男进度条 且 女进度条 < 60%（允许继续运行）。
         """
-        print("\n[女进度条停滞] 执行恢复：多次 ESC → 必要时 J/K 释放 → 等待开始按钮 → 双条近似相等后点击开始。")
+        log(C.FB004)
         self.state.set_status("女进度条停滞：恢复中")
         # 停滞恢复场景单独放宽判定：按需求固定使用 20% 容差。
         near_equal_tolerance = max(float(bar_balance_tolerance), 0.20)
@@ -1222,14 +1720,14 @@ class AutomationEngine:
         if surface is None:
             self.state.manual_pause = True
             self.state.set_status("女进度条停滞：恢复失败，已暂停")
-            print("\n[女进度条停滞] 恢复失败：多次 ESC 与 J/K 后仍未出现开始/结束按钮，已暂停。")
+            log(C.FB005, reason="no_surface")
             return False
         if surface == "finish":
             self.state.set_status("女进度条停滞：点击结束后等待开始")
             if not self._click_finish_until_start_after_stall_rescue():
                 self.state.manual_pause = True
                 self.state.set_status("女进度条停滞：结束后未出现开始，已暂停")
-                print("\n[女进度条停滞] 已尝试点击结束，但未等到开始按钮，已暂停。")
+                log(C.FB005, reason="no_start_after_finish")
                 return False
 
         # 保险等待：即便 3 秒内已出现，也统一进入“开始按钮稳定后再操作”节奏。
@@ -1250,7 +1748,7 @@ class AutomationEngine:
                 sleep(0.2)
                 continue
             try:
-                b1, b2 = self.vision_service.detect_bars(self.vision_service.capture_screen())
+                b1, b2 = self._get_bar_ratios()
             except Exception:
                 sleep(0.15)
                 continue
@@ -1265,19 +1763,14 @@ class AutomationEngine:
             sleep(0.12)
 
         # “循环点击开始按钮”：按钮还在就持续点击，直到进入正常运行阶段。
-        while self.actions.ready_to_start():
-            if self._wait_if_paused_or_interrupted():
-                return False
-            clicked = self.actions.start()
-            if not clicked:
-                # 去抖点击未达成“按钮稳定消失”时，不推进后续动作，避免误进入下一阶段。
-                self.state.log("停滞恢复：开始按钮点击未确认，重试")
-                sleep(0.12)
-                continue
-            self.state.log("停滞恢复：点击开始")
-            x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
-            pyautogui.moveTo(x, y)
-            sleep(0.2)
+        start_result = self._click_start_until_confirmed(
+            experiment_switch_enabled=bool(self.config_store.data.get("experiment_switch_enabled", False)),
+            log_prefix="停滞恢复：",
+        )
+        if start_result is False:
+            return False
+        if start_result == "rebootstrap":
+            return False
 
         return True
 
@@ -1372,8 +1865,8 @@ class AutomationEngine:
                     # 当前实验是本页最后一个（点位号=12），需先退出实验面板，
                     # 拉出新实验滚动，再将点位号置为9，重新进入【尝试选定实验】。
                     self.state.set_status("当页实验全部完成：拉出新实验")
-                    print("\n[实验切换] 点位号=12，执行【当页实验全部完成】：ESC → E → 拉出新实验滚动 → 点位置9。")
-                    pyautogui.press("esc")
+                    log(C.EX006)
+                    self._press_key("esc")
                     sleep(1.0)
                     self.actions.press_experiment_switch_hotkey()
                     sleep(1.0)
@@ -1389,7 +1882,7 @@ class AutomationEngine:
                     # 流程.md 【切换下一实验】（点位号≠12）：
                     # 点赞已在每轮回合结束（再来一次后）处理；此处直接执行切换。
                     self.state.set_status("实验5次完成，执行切换实验")
-                    print(f"\n[实验切换] 点位号={self._experiment_card_index}，执行【切换下一实验】。")
+                    log(C.EX005, idx=self._experiment_card_index + 1)
                     self._experiment_card_index += 1
                     self._experiment_cycle_count = 0
                     self._reopen_experiment_panel_with_esc()
@@ -1417,20 +1910,13 @@ class AutomationEngine:
         if self._wait_until_start_visible_again():
             return
 
-        while self.actions.ready_to_start():
-            if self._wait_if_paused_or_interrupted():
-                return
-            clicked = self.actions.start()
-            if not clicked:
-                # 关键：若本轮未确认成功（按钮未稳定消失），留在当前阶段继续重试。
-                # 这样可抑制“模板瞬时抖动 -> 误判已点击 -> 流程跳转”的问题。
-                self.state.log("开始按钮点击未确认，重试")
-                sleep(0.12)
-                continue
-            self.state.log("点击开始")
-            x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
-            pyautogui.moveTo(x, y)
-            sleep(0.2)
+        start_result = self._click_start_until_confirmed(
+            experiment_switch_enabled=experiment_switch_enabled,
+        )
+        if start_result is False:
+            return
+        if start_result == "rebootstrap":
+            return
 
         # “点击开始后~点击高潮前”阶段：
         # 若发生女进度条停滞，则按新规则执行恢复，并在恢复后继续留在当前实验。
@@ -1446,11 +1932,12 @@ class AutomationEngine:
                 self._female_bar_monitor_active = True
                 self._female_bar_stall_suspend_until = 0.0
                 self._female_bar_stall_wait_special_visible_after_start = True
-            self._female_bar_stall_wait_special_reappear = False
-            self._female_bar_stall_reappear_earliest_ts = 0.0
             # 新一轮「开始~高潮」阶段：刷新令牌，使旧线程中待发送的「1」全部失效。
             self._special_action_phase_token += 1
             self._special_action_expected_token = self._special_action_phase_token
+            self._special_action_last_trigger_ts = 0.0
+            self._reset_special_action_rise_gate()
+            self._special_action_phase_started_at = time()
             self._special_action_monitor_active = True
 
             # 仅在“点击开始后~点击高潮前”阶段启用滚轮纠偏。
@@ -1471,7 +1958,7 @@ class AutomationEngine:
                     # - b1 = 女进度条（原上方进度条）
                     # - b2 = 男进度条（原下方进度条）
                     if now >= next_balance_check_at:
-                        b1, b2 = self.vision_service.detect_bars(self.vision_service.capture_screen())
+                        b1, b2 = self._get_bar_ratios()
                         # EMA：用平滑后的填充率算 diff，抑制单帧跳变导致的纠偏方向抖动。
                         if bar_fill_ema_b1 is None:
                             bar_fill_ema_b1, bar_fill_ema_b2 = b1, b2
@@ -1481,9 +1968,14 @@ class AutomationEngine:
                             bar_fill_ema_b2 = a * b2 + (1.0 - a) * bar_fill_ema_b2
                         diff = bar_fill_ema_b1 - bar_fill_ema_b2
                         if self.state.debug:
-                            print(
-                                f"\n[bar] raw f={b1:.4f} m={b2:.4f} | "
-                                f"ema f={bar_fill_ema_b1:.4f} m={bar_fill_ema_b2:.4f} diff={diff:.4f}"
+                            log_debug(
+                                self.state.debug,
+                                C.BR001,
+                                raw_f=b1,
+                                raw_m=b2,
+                                ema_f=bar_fill_ema_b1,
+                                ema_m=bar_fill_ema_b2,
+                                diff=diff,
                             )
 
                         # 仅当平滑后的 |diff| 超出死区才纠偏；力度随 |diff| 分档，并整体压低批次避免过冲。
@@ -1515,12 +2007,12 @@ class AutomationEngine:
                             if diff > 0:
                                 # 女进度条 > 男进度条：原方向取反后使用 +360。
                                 if self.state.debug:
-                                    print(f"[bar] action=scroll_up sign=+ (female ahead) count={scroll_count}")
+                                    log_debug(self.state.debug, C.BR001, dir="up", count=scroll_count)
                                 self._set_scroll_command(+360, scroll_count)
                             else:
                                 # 女进度条 < 男进度条：原方向取反后使用 -360。
                                 if self.state.debug:
-                                    print(f"[bar] action=scroll_down sign=- (female behind) count={scroll_count}")
+                                    log_debug(self.state.debug, C.BR001, dir="down", count=scroll_count)
                                 self._set_scroll_command(-360, scroll_count)
                         else:
                             # 差值已在容差内：暂停副线程滚轮输出，避免多余扰动。
@@ -1560,11 +2052,12 @@ class AutomationEngine:
             # 高潮阶段点击优先速度，缩短间隔。
             self.actions.wait(0.1)
 
-        while not self.actions.ready_to_finish():
-            if self._wait_if_paused_or_interrupted():
-                return
-            self.state.log("等待结束")
-            self.actions.wait(0.2)
+        finish_wait = self._wait_for_finish_button_with_esc_recovery()
+        if finish_wait == "interrupted":
+            return
+        if finish_wait == "start":
+            self.state.log("结束等待超时：已看到开始按钮")
+            return
 
         finish_missing_checks = 0
         while True:
@@ -1615,6 +2108,7 @@ class AutomationEngine:
             self.state.set_status("初始化完成")
         try:
             while not self.state.stop_requested:
+                self._poll_home_page_scene()
                 if self.state.manual_pause:
                     if self.state.current_status not in (
                         "F1紧急暂停",
@@ -1630,12 +2124,15 @@ class AutomationEngine:
                     self.loop_once()
                 except Exception as exc:
                     self.state.set_status(f"异常: {exc}")
-                    print(f"\n发生异常：{exc}")
+                    log(C.SYS001, err=exc)
                     _sleep_interruptible(1.0, self.state)
         finally:
-            print(
-                f"\n[统计] 本次运行结束汇总：高潮成功共 {self._runtime_total_cum_successes} 次；"
-                f"完成「5回合」实验 {self._runtime_total_five_round_experiments} 个（以各组第 5 次成功高潮计）。"
+            log(
+                C.SYS002,
+                cum=self._runtime_total_cum_successes,
+                five=self._runtime_total_five_round_experiments,
+                sr=self._runtime_start_click_recovery_count,
+                final=1,
             )
             self._scroll_enabled = False
             self._clear_scroll_command()

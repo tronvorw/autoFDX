@@ -18,6 +18,8 @@ from .config import APP_VERSION
 from .config import CALIBRATION_ITEMS
 from .config import PROJECT_ROOT
 from .config import UPDATE_CHECK_GITHUB_REPO
+from . import log_codes as C
+from .run_log import log
 from .self_update import prepare_tag_source_folder
 from .self_update import spawn_post_exit_apply
 from .update_check import fetch_latest_update_candidate
@@ -763,26 +765,17 @@ class CalibrationOverlay:
         s = rects.get("sensitive_progress_bar")
         if item_key == "bar_female" and done.get("sensitive_progress_bar") and isinstance(s, (list, tuple)) and len(s) == 4:
             if top(norm) < bottom(s) - eps:
-                print(
-                    "\n[标定提示] 女进度条顶边高于敏感条底边，框选可能与蓝条区域重叠；"
-                    "红蓝混合会使识别异常。请将女条框在第二根红色条上（紧贴敏感条下方）。"
-                )
+                log(C.CL001, reason="female_above_sensitive")
         if item_key == "bar_male":
             f = rects.get("bar_female")
             if done.get("bar_female") and isinstance(f, (list, tuple)) and len(f) == 4:
                 if top(norm) < bottom(f) - eps:
-                    print(
-                        "\n[标定提示] 男进度条顶边高于女进度条底边，可能与女条重叠。"
-                        "请把男条框在最下方红条上。"
-                    )
+                    log(C.CL001, reason="male_above_female")
         if item_key == "bar_female":
             m = rects.get("bar_male")
             if done.get("bar_male") and isinstance(m, (list, tuple)) and len(m) == 4:
                 if bottom(norm) > top(m) + eps:
-                    print(
-                        "\n[标定提示] 女进度条底边低于已保存的男进度条顶边，女/男上下顺序可能反了或两条区域相交。"
-                        "请确认女在上、男在下。"
-                    )
+                    log(C.CL001, reason="female_below_male")
 
     def save(self):
         self.clamp()
@@ -1186,7 +1179,7 @@ def launch_floating_window(config_store, state, window_service):
     status_var = tk.StringVar(value="流程: init")
     init_run_text = "已暂停" if state.manual_pause else "运行中"
     run_var = tk.StringVar(value=init_run_text)
-    status_line_var = tk.StringVar(value=f"流程: init  |  状态: {init_run_text}")
+    status_line_var = tk.StringVar(value=f"流程: init  |  页面: —  |  状态: {init_run_text}")
     like_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("like_enabled", True)))
     like_force_next_var = tk.BooleanVar(value=bool(config_store.data.get("like_force_next", False)))
     experiment_switch_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("experiment_switch_enabled", False)))
@@ -1402,6 +1395,9 @@ def launch_floating_window(config_store, state, window_service):
             return s
         return s[: max_len - 1] + "…"
 
+    def _scene_text_for_status_line():
+        return str(getattr(state, "scene_label", "—") or "—").replace("\n", " ").strip()
+
     def apply_pause_ui_text():
         run_var.set("已暂停" if state.manual_pause else "运行中")
         btn_pause.set_text(pause_button_text())
@@ -1410,7 +1406,9 @@ def launch_floating_window(config_store, state, window_service):
             btn_pause.set_style(normal_bg=BTN_SUCCESS, hover_bg="#2f8f4a", fg="white")
         else:
             btn_pause.set_style(normal_bg=BTN_DANGER, hover_bg="#dc2626", fg="white")
-        status_line_var.set(f"流程: {_flow_text_for_status_line()}  |  状态: {run_var.get()}")
+        status_line_var.set(
+            f"流程: {_flow_text_for_status_line()}  |  页面: {_scene_text_for_status_line()}  |  状态: {run_var.get()}"
+        )
 
     def toggle_pause():
         # 从“暂停->继续”前，先校验“实验切换”所需标定是否齐全。
@@ -1517,15 +1515,15 @@ def launch_floating_window(config_store, state, window_service):
             state.calibration_overlay_selected_keys = selected
             if selected:
                 state.calibration_overlay_phase = "ready_to_show"
-                print(f"\n[F12] 已选定 {len(selected)} 个标定项，再按一次 F12 显示。")
+                log(C.HK005, action="selected", n=len(selected))
             else:
                 state.calibration_overlay_phase = "idle"
-                print("\n[F12] 未选择任何标定项，已取消。")
+                log(C.HK005, action="empty_cancel")
             close_selector_window(reset_phase=False)
 
         def on_cancel():
             close_selector_window(reset_phase=True)
-            print("\n[F12] 已取消标定项选择。")
+            log(C.HK005, action="cancel")
 
         tk.Button(btn_row, text="取消", command=on_cancel, bg=BTN_DANGER, fg="white", relief="flat").pack(side="right", padx=(6, 0))
         tk.Button(btn_row, text="确定", command=on_confirm, bg=ACCENT, fg="white", relief="flat").pack(side="right")
@@ -1606,7 +1604,7 @@ def launch_floating_window(config_store, state, window_service):
         done_map = config_store.data.get("calibration_done", {})
         if item_key in ("bar_female", "bar_male") and not done_map.get("sensitive_progress_bar", False):
             state.set_status("请先完成「敏感进度条」标定（女/男条将与其同宽同高并可上下平移）")
-            print("\n[标定] 请先完成「敏感进度条」标定，再标定女/男进度条。")
+            log(C.CL001, reason="sensitive_required")
             return
         state.pending_calibration = item_key
 
@@ -2328,7 +2326,7 @@ def launch_floating_window(config_store, state, window_service):
         style="Like.Big.TCheckbutton",
         cursor="hand2",
     )
-    chk_update_beta.pack(anchor="w", pady=(0, 0))
+    chk_update_beta.pack(anchor="w", pady=(0, 4))
     refresh_feature_option_states()
 
     submenu_host = tk.Frame(frame, bg=BG_APP)

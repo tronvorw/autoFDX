@@ -13,7 +13,7 @@ TEMPLATES_DIR = ASSETS_DIR / "templates"
 # 版本与在线更新（悬浮窗「检查更新」；自动替换依赖 tools/apply_update.py）
 # 发布新 tag 时请同步修改 APP_VERSION。
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.0.0-beta.4"
+APP_VERSION = "1.0.0-beta.5"
 UPDATE_CHECK_GITHUB_REPO = "tronvorw/autoFDX"
 # 当 api.github.com 因「共享出口 IP」匿名限流时，从下列地址拉取清单（与发版 tag 同步维护）。
 UPDATE_MANIFEST_FILENAME = "version_manifest.json"
@@ -105,7 +105,7 @@ def build_default_config():
         "like_points": [],
         # 赞池：外接归一化矩形；外圆为矩形内接圆，环宽沿径向 ≈ 比例 × min(宽,高)（圆环区域 = 两圆之间）。
         "like_pool_ring_width_ratio": 0.14,
-        # 圆环内蓝色像素占比 ≥ 该阈值视为「赞池满」。
+        # 圆环充能格占比 ≥ 该阈值视为「赞池满」（分段计数+动态圆心，建议 85%~95%，默认 90%）。
         # 主模式：成功点击再来一次后检测一次；单高潮：主循环约每 5 秒检测。
         "like_pool_blue_full_threshold": 0.90,
         # 实验切换网格（3x4，共 12 点）：
@@ -136,6 +136,29 @@ def build_default_config():
         "stall_recovery_esc_attempts_before_rescue": 3,
         "stall_recovery_rescue_keys": ["j", "k"],
         "stall_recovery_rescue_mode": "alternate",
+        # 特殊动作（主键盘「1」）响应节奏：可在 user_config 中覆盖默认值。
+        "special_action_poll_interval_sec": 0.04,
+        "special_action_press_delay_sec": 0.06,
+        "special_action_key_repeat_count": 3,
+        "special_action_key_repeat_interval_sec": 0.08,
+        "special_action_trigger_cooldown_sec": 0.55,
+        "special_action_sensitive_max": 0.77,
+        "special_action_sensitive_rise_min": 0.02,
+        "special_action_post_rise_delay_sec": 3.0,
+        "special_action_red_threshold": 0.40,
+        "special_action_red_blob_min_ratio": 0.22,
+        "special_action_sens_ema_alpha": 0.40,
+        "special_action_rise_stall_sec": 12.0,
+        "special_action_phase_warmup_sec": 1.2,
+        "finish_wait_timeout_sec": 20.0,
+        "finish_wait_esc_max": 30,
+        # 移动视角部署：整圈旋转时长、连点间隔、微步像素、转速倍率。
+        "deploy_move_duration_sec": 10.0,
+        "deploy_move_click_interval_sec": 0.036,
+        "deploy_move_loop_tick_sec": 0.004,
+        "deploy_move_max_step_px": 10,
+        "deploy_move_poll_interval_sec": 0.08,
+        "deploy_move_speed_multiplier": 2.0,
         # 叠加层模式开关（预留）：
         # False=常规悬浮窗；True=用户选择 DX Hook/Overlay 路径（实验项）。
         "overlay_dx_hook_enabled": False,
@@ -317,8 +340,35 @@ class ConfigStore:
         if rescue_mode not in ("first", "alternate", "random"):
             rescue_mode = "alternate"
         self.data["stall_recovery_rescue_mode"] = rescue_mode
+        self.data.setdefault("special_action_poll_interval_sec", 0.04)
+        self.data.setdefault("special_action_press_delay_sec", 0.06)
+        self.data.setdefault("special_action_key_repeat_count", 3)
+        self.data.setdefault("special_action_key_repeat_interval_sec", 0.08)
+        self.data.setdefault("special_action_trigger_cooldown_sec", 0.55)
+        self.data.setdefault("special_action_sensitive_max", 0.77)
+        self.data.setdefault("special_action_sensitive_rise_min", 0.02)
+        self.data.setdefault("special_action_post_rise_delay_sec", 3.0)
+        self.data.setdefault("special_action_red_threshold", 0.40)
+        self.data.setdefault("special_action_red_blob_min_ratio", 0.22)
+        self.data.setdefault("special_action_sens_ema_alpha", 0.40)
+        self.data.setdefault("special_action_rise_stall_sec", 12.0)
+        self.data.setdefault("special_action_phase_warmup_sec", 1.2)
+        self.data.setdefault("finish_wait_timeout_sec", 20.0)
+        self.data.setdefault("finish_wait_esc_max", 30)
+        self.data.setdefault("deploy_move_duration_sec", 10.0)
+        self.data.setdefault("deploy_move_click_interval_sec", 0.036)
+        self.data.setdefault("deploy_move_loop_tick_sec", 0.004)
+        self.data.setdefault("deploy_move_max_step_px", 10)
+        self.data.setdefault("deploy_move_poll_interval_sec", 0.08)
+        self.data.setdefault("deploy_move_speed_multiplier", 2.0)
         self.data.setdefault("like_pool_ring_width_ratio", 0.14)
         self.data.setdefault("like_pool_blue_full_threshold", 0.90)
+        # 旧版默认 80% 在分段计数+圆心学习下偏易误触，自动抬升到 90%。
+        try:
+            if abs(float(self.data.get("like_pool_blue_full_threshold", 0.90)) - 0.80) < 1e-6:
+                self.data["like_pool_blue_full_threshold"] = 0.90
+        except Exception:
+            self.data["like_pool_blue_full_threshold"] = 0.90
         # 实验切换：补齐当前实验索引与 12 点网格数据。
         self.data.setdefault("current_experiment", [1, 1])
         self.data.setdefault("experiment_points", [])

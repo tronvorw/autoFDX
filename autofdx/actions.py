@@ -8,6 +8,9 @@ import keyboard
 import numpy as np
 import pyautogui
 
+from . import log_codes as C
+from .run_log import log, log_debug
+
 # ---------------------------------------------------------------------------
 # SendInput 底层鼠标移动（仅 Windows）
 # 结构体布局必须与 WinUser.h 一致，否则 SendInput 返回 0。
@@ -17,6 +20,8 @@ if sys.platform == "win32":
 
     _INPUT_MOUSE = 0
     _MOUSEEVENTF_MOVE = 0x0001
+    _MOUSEEVENTF_LEFTDOWN = 0x0002
+    _MOUSEEVENTF_LEFTUP = 0x0004
 
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -71,24 +76,59 @@ if sys.platform == "win32":
         sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
         if sent != 1:
             err = ctypes.get_last_error()
-            print(f"[SendInput] 失败 sent={sent}, GetLastError={err}")
+            log(C.SYS003, sent=sent, err=err)
             return False
         return True
+
+    def _send_left_click() -> None:
+        """SendInput 左键按下/抬起，比 pyautogui 更适合高频连点。"""
+        for flag in (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP):
+            inp = _INPUT()
+            inp.type = _INPUT_MOUSE
+            inp.u.mi = _MOUSEINPUT(0, 0, 0, flag, 0, _ULONG_PTR(0))
+            sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
+            if sent != 1:
+                err = ctypes.get_last_error()
+                log(C.SYS003, sent=sent, err=err, kind="click")
+                return
 else:
     def _send_relative_move(dx: int, dy: int) -> bool:
         """非 Windows 回退：用 pyautogui 模拟。"""
         pyautogui.moveRel(dx, dy)
         return True
 
+    def _send_left_click() -> None:
+        pyautogui.leftClick()
+
 
 class GameActions:
     """负责点击与滚动行为，不关心识别细节。"""
 
-    def __init__(self, config_store, state, window_service, vision_service):
+    def __init__(
+        self,
+        config_store,
+        state,
+        window_service,
+        vision_service,
+    ):
         self.config_store = config_store
         self.state = state
         self.window_service = window_service
         self.vision_service = vision_service
+        self._last_special_action_red_info = {}
+
+    def _inp(self):
+        return None
+
+    def _move_rel(self, dx: int, dy: int) -> bool:
+        return _send_relative_move(dx, dy)
+
+    def _left_click_sendinput(self) -> None:
+        _send_left_click()
+
+    def reset_dynamic_learned_regions(self):
+        """清空赞池圆心等动态区域（特殊动作判红始终用用户标定框）。"""
+        self.vision_service.reset_learned_progress_bar_regions()
 
     @property
     def config(self):
@@ -117,8 +157,8 @@ class GameActions:
         miss_count = 0
         miss_need = max(1, int(stable_miss_required))
         while monotonic() < deadline:
-            # 必须“连续 miss”达到阈值，才算成功消失。
-            if self.vision_service.match(template_name) is None:
+            cleared = self.vision_service.match(template_name) is None
+            if cleared:
                 miss_count += 1
                 if miss_count >= miss_need:
                     return True
@@ -154,7 +194,8 @@ class GameActions:
         return self.vision_service.match("start")
 
     def ready_to_cum(self):
-        return self.vision_service.match(f"cum{self.state.cum_mode}")
+        key = f"cum{self.state.cum_mode}"
+        return self.vision_service.match(key)
 
     def ready_to_cum_single(self):
         """
@@ -195,23 +236,44 @@ class GameActions:
         # 这里分两段完成，同步增强可见性与稳定性。
         first_step = int(move_x * 0.65)
         second_step = max(1, move_x - first_step)
-        pyautogui.moveRel(first_step, 0, duration=0.14)
-        sleep(0.06)
-        pyautogui.moveRel(second_step, 0, duration=0.14)
+        inp = self._inp()
+        if inp is not None:
+            inp.move_rel(first_step, 0, duration=0.14)
+            sleep(0.06)
+            inp.move_rel(second_step, 0, duration=0.14)
+        else:
+            pyautogui.moveRel(first_step, 0, duration=0.14)
+            sleep(0.06)
+            pyautogui.moveRel(second_step, 0, duration=0.14)
         # 去抖：移动后再稍等，避免“刚移动就点击”造成落点不稳定。
         sleep(0.15)
 
+    def _click_at_match(self, template_name):
+        pos = self.vision_service.match(template_name)
+        if not pos:
+            return None
+        inp = self._inp()
+        if inp is not None:
+            inp.move_to(pos[0], pos[1])
+        else:
+            pyautogui.moveTo(pos[0], pos[1])
+        return pos
+
     def start(self):
         def _click_once():
-            # 每次重试都重新取当前模板中心，避免首次坐标过期导致“越点越偏”。
-            pos = self.vision_service.match("start")
-            if not pos:
+            if self._click_at_match("start") is None:
                 return
-            pyautogui.moveTo(pos[0], pos[1])
-            self.wait(0.12)
-            pyautogui.leftClick()
-            self.wait(0.14)
-            pyautogui.leftClick()
+            inp = self._inp()
+            if inp is not None:
+                self.wait(0.12)
+                inp.left_click()
+                self.wait(0.14)
+                inp.left_click()
+            else:
+                self.wait(0.12)
+                pyautogui.leftClick()
+                self.wait(0.14)
+                pyautogui.leftClick()
             self.wait(0.08)
             self._move_mouse_right_after_click("start")
 
@@ -221,14 +283,15 @@ class GameActions:
         key = f"cum{self.state.cum_mode}"
 
         def _click_once():
-            # 每次重试动态取点，兼容按钮动画抖动/轻微位移。
-            pos = self.vision_service.match(key)
-            if not pos:
+            if self._click_at_match(key) is None:
                 return
-            pyautogui.moveTo(pos[0], pos[1])
-            self.wait(0.12)
-            # 略微拉开双击间隔，降低与游戏输入竞争导致的漏触发。
-            pyautogui.click(clicks=2, interval=0.08)
+            inp = self._inp()
+            if inp is not None:
+                self.wait(0.12)
+                inp.click(clicks=2, interval=0.08)
+            else:
+                self.wait(0.12)
+                pyautogui.click(clicks=2, interval=0.08)
             self.wait(0.08)
             self._move_mouse_right_after_click(key)
 
@@ -243,14 +306,15 @@ class GameActions:
         key = "cum_single"
 
         def _click_once():
-            # 每次重试动态取点，兼容按钮动画抖动/轻微位移。
-            pos = self.vision_service.match(key)
-            if not pos:
+            if self._click_at_match(key) is None:
                 return
-            pyautogui.moveTo(pos[0], pos[1])
-            self.wait(0.12)
-            # 略微拉开双击间隔，降低与游戏输入竞争导致的漏触发。
-            pyautogui.click(clicks=2, interval=0.08)
+            inp = self._inp()
+            if inp is not None:
+                self.wait(0.12)
+                inp.click(clicks=2, interval=0.08)
+            else:
+                self.wait(0.12)
+                pyautogui.click(clicks=2, interval=0.08)
             self.wait(0.08)
             self._move_mouse_right_after_click(key)
 
@@ -258,15 +322,19 @@ class GameActions:
 
     def finish(self):
         def _click_once():
-            # 每次重试动态取点，避免使用陈旧坐标。
-            pos = self.vision_service.match("finish")
-            if not pos:
+            if self._click_at_match("finish") is None:
                 return
-            pyautogui.moveTo(pos[0], pos[1])
-            self.wait(0.12)
-            pyautogui.leftClick()
-            self.wait(0.14)
-            pyautogui.leftClick()
+            inp = self._inp()
+            if inp is not None:
+                self.wait(0.12)
+                inp.left_click()
+                self.wait(0.14)
+                inp.left_click()
+            else:
+                self.wait(0.12)
+                pyautogui.leftClick()
+                self.wait(0.14)
+                pyautogui.leftClick()
             self.wait(0.08)
             self._move_mouse_right_after_click("finish")
 
@@ -275,7 +343,13 @@ class GameActions:
     def move_to_scroll_region_center(self):
         r = self.config["scroll_region"]
         left, top, width, height = self.window_service.get_window_region()
-        pyautogui.moveTo(int(left + (r[0] + r[2]) * width / 2), int(top + (r[1] + r[3]) * height / 2))
+        x = int(left + (r[0] + r[2]) * width / 2)
+        y = int(top + (r[1] + r[3]) * height / 2)
+        inp = self._inp()
+        if inp is not None:
+            inp.move_to(x, y)
+        else:
+            pyautogui.moveTo(x, y)
 
     def _point_by_1based_index(self, points, index_1based):
         """
@@ -298,15 +372,25 @@ class GameActions:
         """
         if abs_point is None:
             return False
-        pyautogui.moveTo(abs_point[0], abs_point[1])
-        sleep(0.08)
-        pyautogui.leftClick()
+        inp = self._inp()
+        if inp is not None:
+            inp.move_to(abs_point[0], abs_point[1])
+            sleep(0.08)
+            inp.left_click()
+        else:
+            pyautogui.moveTo(abs_point[0], abs_point[1])
+            sleep(0.08)
+            pyautogui.leftClick()
         sleep(0.08)
         return True
 
     def press_experiment_switch_hotkey(self):
         """实验切换入口热键：按下 E。"""
-        pyautogui.press("e")
+        inp = self._inp()
+        if inp is not None:
+            inp.press("e")
+        else:
+            pyautogui.press("e")
         sleep(0.12)
 
     def click_body_part(self, index_1based):
@@ -327,9 +411,8 @@ class GameActions:
 
     def estimate_selected_body_part_index_1based(self, min_spread=10.0):
         """
-        根据当前游戏窗口截图：对 7 个身体部位六边形（与标定一致）内部求平均灰度，
+        根据当前游戏窗口截图：对 7 个身体部位六边形内部求平均灰度，
         最暗的一格通常对应 UI「当前选中」。
-        返回 1~7；若七格亮度差小于 min_spread（0~255）或未标定齐 7 点，返回 None。
         """
         from .body_part_hex import detect_selected_body_part_by_darkest_hex
 
@@ -419,13 +502,13 @@ class GameActions:
         steps = total_dx // step_px
         remainder = total_dx % step_px
         for _ in range(steps):
-            _send_relative_move(step_px, 0)
+            self._move_rel(step_px, 0)
             sleep(0.02)
         if remainder > 0:
-            _send_relative_move(remainder, 0)
+            self._move_rel(remainder, 0)
         # 移动完成后短暂稳定，避免游戏来不及响应
         sleep(0.1)
-        print(f"\n[移动视角] SendInput 向右移动 {total_dx}px（屏幕宽 {screen_w} 的 1/10）。")
+        log(C.MV001, dx=total_dx, screen_w=screen_w)
 
     def _rotation_target_dx_360(self):
         """
@@ -446,31 +529,64 @@ class GameActions:
         dpi = max(72, min(384, dpi))
         return max(int(screen_w), int(screen_w * (dpi / 96.0)))
 
-    def move_camera_burst_deploy_check(self, duration_sec=5.0, poll_interval_sec=0.06):
-        """
-        【移动视角部署】在整段 duration_sec 内**同时**进行：
-        - 鼠标相对屏幕**匀速、连续向右移动**（按时间积分位移，观感平滑；总行程≈_rotation_target_dx_360()，约一整圈+DPI 适配）；
-        - **不间断**左键点击尝试部署（固定间隔，避免过快被系统/游戏吞掉）。
+    def _deploy_move_settings(self, duration_sec=None):
+        cfg = self.config
+        if duration_sec is None:
+            try:
+                duration_sec = float(cfg.get("deploy_move_duration_sec", 10.0))
+            except Exception:
+                duration_sec = 10.0
+        try:
+            click_iv = float(cfg.get("deploy_move_click_interval_sec", 0.036))
+        except Exception:
+            click_iv = 0.036
+        try:
+            loop_tick = float(cfg.get("deploy_move_loop_tick_sec", 0.004))
+        except Exception:
+            loop_tick = 0.004
+        try:
+            max_step = int(cfg.get("deploy_move_max_step_px", 10))
+        except Exception:
+            max_step = 10
+        try:
+            poll_iv = float(cfg.get("deploy_move_poll_interval_sec", 0.08))
+        except Exception:
+            poll_iv = 0.08
+        try:
+            speed_mul = float(cfg.get("deploy_move_speed_multiplier", 2.0))
+        except Exception:
+            speed_mul = 2.0
+        return {
+            "duration_sec": max(1.0, float(duration_sec)),
+            "click_interval_sec": max(0.02, click_iv),
+            "loop_tick_sec": max(0.002, loop_tick),
+            "max_step_px": max(1, min(32, max_step)),
+            "poll_interval_sec": max(0.04, poll_iv),
+            "speed_multiplier": max(1.0, min(4.0, speed_mul)),
+        }
 
-        主循环高频刷新位移（loop_tick_sec），模板检测按 poll_interval_sec 节流。
-        口径与 deploy_and_check_start_recover 一致。
-
-        返回 (start_seen, both_ready)：
-        - both_ready=True：已可同时检测到开始+恢复体力；
-        - start_seen=True 且 both_ready=False：曾出现开始但未同时满足恢复体力；
-        - start_seen=False：整个窗口内未稳定出现开始按钮。
+    def move_camera_burst_deploy_check(self, duration_sec=None, poll_interval_sec=None):
         """
-        ws = max(0.5, float(duration_sec))
+        【移动视角部署】在整段窗口内**同时**进行：
+        - 鼠标相对屏幕匀速、**微步连续**向右移动（按时间积分，每拍最多移动 max_step_px，观感接近 360° 平滑转圈）；
+        - 高频 SendInput 左键连点尝试部署。
+
+        返回 (start_seen, both_ready)，口径与 deploy_and_check_start_recover 一致。
+        """
+        move_cfg = self._deploy_move_settings(duration_sec)
+        ws = move_cfg["duration_sec"]
+        if poll_interval_sec is not None:
+            poll_interval_sec = max(0.04, float(poll_interval_sec))
+        else:
+            poll_interval_sec = move_cfg["poll_interval_sec"]
+        loop_tick_sec = move_cfg["loop_tick_sec"]
+        click_interval_sec = move_cfg["click_interval_sec"]
+        max_step_px = move_cfg["max_step_px"]
+        speed_multiplier = move_cfg["speed_multiplier"]
+
         screen_w, _ = pyautogui.size()
         rotation_target_dx = self._rotation_target_dx_360()
-        # 匀速：整段窗口内平均角速度，使结束时累积位移≈一整圈标定值。
-        velocity_px_per_sec = float(rotation_target_dx) / ws
-        # 单次 SendInput 位移上限，拆段注入，避免单帧过大。
-        max_chunk = 512
-        # 主循环节拍：位移按「已过时间」追赶目标，节拍越细观感越平滑。
-        loop_tick_sec = 0.006
-        # 左键间隔：略大于 0 即视为「不停点」，过密可能被合并为一次。
-        click_interval_sec = 0.065
+        velocity_px_per_sec = (float(rotation_target_dx) / ws) * speed_multiplier
 
         outer_deadline = monotonic() + ws
         loop_start = monotonic()
@@ -482,44 +598,54 @@ class GameActions:
                 dpi_show = int(ctypes.windll.user32.GetDpiForSystem())
             except Exception:
                 dpi_show = 96
-        print(
-            f"\n[移动视角部署] {ws:.0f}s 平滑匀速右移 + 连续左键：目标总位移≈{rotation_target_dx}px"
-            f"（≈{velocity_px_per_sec:.1f}px/s，屏宽={screen_w}px，DPI≈{dpi_show}）。"
+        log(
+            C.MV002,
+            ws=ws,
+            target_dx=rotation_target_dx,
+            v=velocity_px_per_sec,
+            screen_w=screen_w,
+            dpi=dpi_show,
+            step=max_step_px,
+            click_iv=click_interval_sec,
+            speed=speed_multiplier,
         )
 
-        def _send_dx_total(dx: int) -> None:
-            """将 dx 拆成多段注入并累加到 cumulative_dx。"""
+        def _send_dx_micro(dx: int) -> None:
             nonlocal cumulative_dx
-            left = int(dx)
+            left = max(0, int(dx))
             while left > 0:
-                chunk = min(max_chunk, left)
-                _send_relative_move(chunk, 0)
+                chunk = min(max_step_px, left)
+                self._move_rel(chunk, 0)
                 cumulative_dx += chunk
                 left -= chunk
 
-        # 首拍即可点一次；之后按 click_interval_sec 重复。
         last_click_t = loop_start - click_interval_sec
-        last_vision_t = loop_start - float(poll_interval_sec)
+        last_vision_t = loop_start - poll_interval_sec
 
         while monotonic() < outer_deadline:
             if self.state.stop_requested:
-                print("\n[移动视角部署] 已请求停止，中断连续尝试。")
+                log(C.MV002, reason="stop_requested")
                 return start_seen, False
 
             now = monotonic()
             elapsed = max(0.0, now - loop_start)
-            # 平滑：当前时刻「应已移动」的整数像素，不超过整圈目标。
             ideal_cumulative = min(float(rotation_target_dx), velocity_px_per_sec * elapsed)
             target_int = min(rotation_target_dx, int(ideal_cumulative))
             delta = target_int - cumulative_dx
             if delta > 0:
-                _send_dx_total(delta)
+                # 模板检测会阻塞主循环；落后时连续微步追平，避免 10s 内走不满一整圈。
+                chase_budget = max(max_step_px * 8, int(velocity_px_per_sec * 0.05))
+                while delta > 0 and chase_budget > 0:
+                    step = min(max_step_px, delta, chase_budget)
+                    _send_dx_micro(step)
+                    chase_budget -= step
+                    delta = target_int - cumulative_dx
 
             if now - last_click_t >= click_interval_sec:
-                pyautogui.leftClick()
+                self._left_click_sendinput()
                 last_click_t = now
 
-            if now - last_vision_t >= float(poll_interval_sec):
+            if now - last_vision_t >= poll_interval_sec:
                 last_vision_t = now
                 has_start = bool(self.ready_to_start())
                 try:
@@ -529,24 +655,20 @@ class GameActions:
                 if has_start:
                     start_seen = True
                 if has_start and has_recover:
-                    print("\n[移动视角部署] 连续尝试中已成功：开始按钮与恢复体力按钮均检测到。")
+                    log(C.MV002, reason="ok_mid_try")
                     return True, True
 
             sleep(loop_tick_sec)
 
-        # 舍入误差收尾，尽量凑满整圈标定（不打断上面的提前成功返回）。
         rem = rotation_target_dx - cumulative_dx
         if rem > 0:
-            _send_dx_total(rem)
+            _send_dx_micro(rem)
         if cumulative_dx < rotation_target_dx:
-            print(
-                f"\n[移动视角部署] 警告：{ws:.0f}s 结束时累积位移 {cumulative_dx}px < 目标 {rotation_target_dx}px，"
-                "若视角仍不足一圈可适当提高游戏鼠标灵敏度或延长 duration_sec。"
-            )
+            log(C.MV002, reason="under_rotate", ws=ws, dx=cumulative_dx, target=rotation_target_dx)
         if start_seen:
-            print(f"\n[移动视角部署] {ws:.0f}s 内出现过开始按钮，但恢复体力按钮未同时满足。")
+            log(C.MV002, reason="start_no_recover", ws=ws)
             return True, False
-        print(f"\n[移动视角部署] {ws:.0f}s 连续尝试结束：未检测到开始按钮。")
+        log(C.MV002, reason="no_start", ws=ws)
         return False, False
 
     def has_recover_stamina_button(self, timeout_sec=2.0, poll_interval_sec=0.06):
@@ -557,11 +679,12 @@ class GameActions:
         """
         deadline = monotonic() + max(0.1, float(timeout_sec))
         while monotonic() < deadline:
-            if self.vision_service.match("recover_stamina_button") is not None:
-                print("\n[恢复体力按钮检测] 检测到恢复体力按钮。")
+            hit = self.vision_service.match("recover_stamina_button") is not None
+            if hit:
+                log(C.RS001, ok=1)
                 return True
             sleep(max(0.01, float(poll_interval_sec)))
-        print("\n[恢复体力按钮检测] 超时未检测到恢复体力按钮。")
+        log(C.RS001, ok=0)
         return False
 
     def deploy_and_check_start_recover(self, timeout_sec=2.0, poll_interval_sec=0.06):
@@ -574,7 +697,7 @@ class GameActions:
           3) 若开始按钮始终未出现 -> (start_seen=False, both_ready=False)
         """
         ws = max(1.0, float(timeout_sec))
-        print(f"\n[部署实验] 左键尝试部署，并在 {ws:.1f}s 内同时检测开始按钮+恢复体力按钮...")
+        log(C.DP001, ws=ws, mode="start_recover")
         pyautogui.leftClick()
         deadline = monotonic() + ws
         start_seen = False
@@ -584,14 +707,14 @@ class GameActions:
             if has_start:
                 start_seen = True
             if has_start and has_recover:
-                print("\n[部署实验] 成功：开始按钮与恢复体力按钮均检测到。")
+                log(C.DP002, mode="start_recover")
                 return True, True
             sleep(max(0.01, float(poll_interval_sec)))
 
         if start_seen:
-            print(f"\n[部署实验] 失败：{ws:.1f}s 内出现过开始按钮，但恢复体力按钮未出现。")
+            log(C.DP003, reason="no_recover", ws=ws)
             return True, False
-        print(f"\n[部署实验] 失败：{ws:.1f}s 内未出现开始按钮。")
+        log(C.DP003, reason="no_start", ws=ws)
         return False, False
 
     def _capture_calibration_region_bgr(self, key):
@@ -613,6 +736,88 @@ class GameActions:
             return None
         shot = pyautogui.screenshot(region=(left + x1, top + y1, x2 - x1, y2 - y1))
         return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+
+    def _capture_window_rect_bgr(self, rx1, ry1, rx2, ry2):
+        """按窗口内像素矩形截屏，返回 BGR；非法区域返回 None。"""
+        left, top, width, height = self.window_service.get_window_region()
+        rx1 = max(0, min(width, int(rx1)))
+        ry1 = max(0, min(height, int(ry1)))
+        rx2 = max(0, min(width, int(rx2)))
+        ry2 = max(0, min(height, int(ry2)))
+        if rx2 <= rx1 or ry2 <= ry1:
+            return None
+        shot = pyautogui.screenshot(region=(left + rx1, top + ry1, rx2 - rx1, ry2 - ry1))
+        return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+
+    def _special_action_calibration_rect(self):
+        """特殊动作按钮：始终使用用户标定外接框（尺寸≈按钮），返回 (rx1, ry1, rx2, ry2)。"""
+        key = "special_action_button"
+        if not bool(self.config.get("calibration_done", {}).get(key, False)):
+            return None
+        norm = self.config.get("calibration_rects", {}).get(key)
+        if (not isinstance(norm, list)) or len(norm) != 4:
+            return None
+        x1, y1, x2, y2 = self.window_service.denormalize_region(norm)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2, y2
+
+    def _special_action_largest_red_bbox(self, clean, min_area=16):
+        """在掩膜中取面积最大的红色连通域包围盒 (x1,y1,x2,y2)，忽略零散噪点。"""
+        if clean is None or clean.max() == 0:
+            return None
+        n, _labels, stats, _centroids = cv2.connectedComponentsWithStats(clean, connectivity=8)
+        best = None
+        best_area = 0
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < min_area or area <= best_area:
+                continue
+            best_area = area
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            best = (x, y, x + w - 1, y + h - 1)
+        return best
+
+    def _special_action_red_blob_large_enough(self, bbox, cal_w, cal_h, min_ratio=0.28):
+        """红块宽高须达到标定框一定比例，过滤进度条边缘等细条误检。"""
+        if bbox is None:
+            return False
+        x1, y1, x2, y2 = bbox
+        bw = max(1, x2 - x1 + 1)
+        bh = max(1, y2 - y1 + 1)
+        return bw >= cal_w * min_ratio and bh >= cal_h * min_ratio
+
+    def _red_mask_clean_binary(self, bgr_img):
+        """红色掩膜经形态学去噪后的二值图；无红色时返回 None。"""
+        mask = self._build_red_mask(bgr_img)
+        if mask is None:
+            return None
+        bin_mask = (mask > 0).astype(np.uint8)
+        if bin_mask.max() == 0:
+            return None
+        kernel = np.ones((3, 3), np.uint8)
+        clean = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN, kernel)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
+        if clean.max() == 0:
+            clean = bin_mask
+        return clean
+
+    def _special_action_red_component_score(self, bgr_img):
+        """
+        在标定框 crop 内取「最大红色连通块」的填充占比（块内红像素/块面积）。
+        """
+        clean = self._red_mask_clean_binary(bgr_img)
+        bbox = self._special_action_largest_red_bbox(clean)
+        if bbox is None:
+            return 0.0, None
+        x1, y1, x2, y2 = bbox
+        core = clean[y1 : y2 + 1, x1 : x2 + 1]
+        if core.size == 0:
+            return 0.0, bbox
+        return float(np.count_nonzero(core)) / float(core.size), bbox
 
     def _build_red_mask(self, bgr_img):
         """
@@ -670,7 +875,7 @@ class GameActions:
             return None
         hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
         # 蓝色大致在 H=[95,135]，S/V 放宽以覆盖游戏内抗锯齿和半透明边缘。
-        return cv2.inRange(hsv, np.array([95, 55, 50]), np.array([135, 255, 255]))
+        return cv2.inRange(hsv, np.array([90, 45, 45]), np.array([140, 255, 255]))
 
     def _blue_fill_ratio(self, bgr_img):
         """
@@ -697,16 +902,12 @@ class GameActions:
 
     def get_sensitive_progress_bar_ratio(self):
         """返回“敏感进度条”填充占比；未标定时返回 None。"""
-        crop = self._capture_calibration_region_bgr("sensitive_progress_bar")
-        if crop is None:
-            return None
-        # 按最新规则：敏感进度条颜色为蓝色。
-        return self._blue_fill_ratio(crop)
+        return self.vision_service.get_sensitive_progress_bar_ratio()
 
     def is_special_action_button_present(self):
         """
         是否存在特殊动作按钮（仅模板匹配，不判颜色）：
-        - 用于「按钮已出现在画面上」类逻辑（开局等待、消失/再出现语义）；
+        - 始终使用标定模板区域匹配；
         - 与 is_special_action_button_red（可触发态）区分。
         """
         try:
@@ -716,24 +917,132 @@ class GameActions:
         except Exception:
             return False
 
-    def is_special_action_button_red(self, threshold=0.60):
+    def _special_action_red_threshold(self):
+        try:
+            return float(self.config.get("special_action_red_threshold", 0.40))
+        except Exception:
+            return 0.40
+
+    def _special_action_red_blob_min_ratio(self):
+        try:
+            return float(self.config.get("special_action_red_blob_min_ratio", 0.22))
+        except Exception:
+            return 0.22
+
+    def is_special_action_button_red(self, threshold=None):
         """
-        判断特殊动作按钮是否处于「可触发」的红色态（区域内红色占比 >= threshold）。
-        仅用于触发主键盘「1」的条件，不用于判断按钮是否在画面上存在。
+        判断特殊动作按钮是否处于「可触发」的红色态。
+        始终在用户标定框内判红：最大红色连通块填充率 ≥ 阈值，且块尺寸须接近按钮大小。
         """
-        crop = self._capture_calibration_region_bgr("special_action_button")
-        if crop is None:
+        if threshold is None:
+            threshold = self._special_action_red_threshold()
+        min_ratio = self._special_action_red_blob_min_ratio()
+        cal = self._special_action_calibration_rect()
+        if cal is None:
+            self._last_special_action_red_info = {"reason": "no_cal"}
             return False
-        ratio = self._red_ratio(crop)
-        return ratio >= float(threshold)
+        cal_x1, cal_y1, cal_x2, cal_y2 = cal
+        cal_w = max(1, cal_x2 - cal_x1)
+        cal_h = max(1, cal_y2 - cal_y1)
+        crop = self._capture_window_rect_bgr(cal_x1, cal_y1, cal_x2, cal_y2)
+        if crop is None:
+            self._last_special_action_red_info = {"reason": "no_crop", "mode": "calibration_rect"}
+            return False
+        score, bbox = self._special_action_red_component_score(crop)
+        fill_score = self._red_fill_ratio(crop)
+        info = {
+            "mode": "calibration_rect",
+            "red": score,
+            "fill": fill_score,
+            "th": float(threshold),
+            "x": cal_x1,
+            "y": cal_y1,
+            "w": cal_w,
+            "h": cal_h,
+        }
+        large_enough = bbox is not None and self._special_action_red_blob_large_enough(
+            bbox, cal_w, cal_h, min_ratio=min_ratio
+        )
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            info["bw"] = max(1, x2 - x1 + 1)
+            info["bh"] = max(1, y2 - y1 + 1)
+
+        if large_enough:
+            effective = max(score, fill_score * 0.92)
+            info["red"] = effective
+            is_red = effective >= float(threshold)
+            info["reason"] = None if is_red else "red_low"
+            self._last_special_action_red_info = info
+            if self.state.debug:
+                log_debug(
+                    self.state.debug,
+                    C.SA006,
+                    mode="calibration_rect",
+                    fill=effective,
+                    th=threshold,
+                )
+            return is_red
+
+        soft_w = cal_w * min_ratio * 0.55
+        soft_h = cal_h * min_ratio * 0.55
+        if (
+            bbox is not None
+            and fill_score >= float(threshold) * 0.92
+            and info.get("bw", 0) >= soft_w
+            and info.get("bh", 0) >= soft_h
+        ):
+            info["red"] = fill_score
+            info["reason"] = "red_fill"
+            self._last_special_action_red_info = info
+            return True
+
+        info["reason"] = "red_small"
+        info["red"] = score if bbox is not None else fill_score
+        self._last_special_action_red_info = info
+        return False
+
+    def evaluate_special_action_trigger(self, sensitive_max=0.80, red_threshold=None, detail=False):
+        """
+        特殊动作触发条件：敏感条 < sensitive_max 且按钮判红。
+        敏感条不满足时跳过判红截图，减少无效开销。
+        返回 (是否触发, 敏感条占比或 None)。
+        """
+        sensitive_ratio = self.get_sensitive_progress_bar_ratio()
+        if sensitive_ratio is None:
+            if detail:
+                return False, None, {"reason": "no_sens"}
+            return False, None
+        if sensitive_ratio >= float(sensitive_max):
+            if detail:
+                return False, sensitive_ratio, {"reason": "sens_high", "max": float(sensitive_max)}
+            return False, sensitive_ratio
+        if not self.is_special_action_button_red(threshold=red_threshold):
+            if detail:
+                info = dict(self._last_special_action_red_info or {})
+                info.setdefault("reason", "no_red")
+                return False, sensitive_ratio, info
+            return False, sensitive_ratio
+        if detail:
+            return True, sensitive_ratio, dict(self._last_special_action_red_info or {})
+        return True, sensitive_ratio
+
+    def _special_action_key_repeat_settings(self):
+        """主键盘「1」连按次数与间隔（config 可覆盖）。"""
+        try:
+            count = int(self.config.get("special_action_key_repeat_count", 3))
+        except Exception:
+            count = 3
+        try:
+            interval = float(self.config.get("special_action_key_repeat_interval_sec", 0.08))
+        except Exception:
+            interval = 0.08
+        return max(1, count), max(0.04, interval)
 
     def press_main_keyboard_one_after_delay(self, delay_sec=0.5, abort_check=None):
         """
-        延迟后触发主键盘“1”（非小键盘）：
-        - 使用 keyboard.press_and_release("1")；
-        - 用于替代“点击特殊动作按钮中心”的旧逻辑。
-        - abort_check：可选，返回 True 表示应取消本次按键（阶段已结束/已暂停等）。
-          延迟期间分段睡眠并轮询，避免固定 sleep 结束后再退出导致误触。
+        延迟后连按主键盘「1」（非小键盘），默认 3 次、间隔极短去抖。
+        - abort_check：返回 True 时取消；延迟与各次按键之间均会二次校验。
         """
         total = max(0.0, float(delay_sec))
         deadline = monotonic() + total
@@ -743,12 +1052,28 @@ class GameActions:
             sleep(0.02)
         if abort_check and abort_check():
             return False
+
+        repeat_count, repeat_interval = self._special_action_key_repeat_settings()
+        inp = self._inp()
         try:
-            keyboard.press_and_release("1")
-            print("\n[特殊动作] 已触发主键盘“1”。")
+            if inp is not None:
+                return inp.press_after_delay(
+                    "1",
+                    0.0,
+                    abort_check=abort_check,
+                    repeat=repeat_count,
+                    interval=repeat_interval,
+                )
+            for i in range(repeat_count):
+                if abort_check and abort_check():
+                    return False
+                keyboard.press_and_release("1")
+                if i < repeat_count - 1:
+                    sleep(repeat_interval)
+            log(C.SA004, n=repeat_count, interval=repeat_interval)
             return True
         except Exception as exc:
-            print(f"\n[特殊动作] 触发主键盘“1”失败：{exc}")
+            log(C.SA005, err=exc)
             return False
 
     def replay_pull_new_experiment_scroll_action(self, delay_sec=1.0):
@@ -767,30 +1092,34 @@ class GameActions:
         except Exception:
             distance = 0.0
         if distance <= 0.0:
-            print("\n[拉出新实验滚动] 重播跳过：向下滚动距离为0，请先完成该标定。")
+            log(C.SC001, reason="distance_zero")
             return False
         try:
             sleep(max(0.0, float(delay_sec)))
             x, y = self.window_service.denormalize_point([ax, ay])
-            pyautogui.moveTo(x, y)
-            # 按需求固定“向下滚动”。
-            # 新比例：1档=10滚轮单位，支持小数档位（如 8.5 -> 85 单位）。
+            inp = self._inp()
+            if inp is not None:
+                inp.move_to(x, y)
+            else:
+                pyautogui.moveTo(x, y)
             total_units = max(0, int(round(distance * 10.0)))
             full_steps = total_units // 10
             remain_units = total_units % 10
             for _ in range(full_steps):
-                pyautogui.scroll(-10)
-                # 提速 2 倍：每步滚动间隔由 10ms 降到 5ms。
+                if inp is not None:
+                    inp.scroll(-10, x, y)
+                else:
+                    pyautogui.scroll(-10)
                 sleep(0.005)
             if remain_units > 0:
-                pyautogui.scroll(-remain_units)
-            print(
-                f"\n[拉出新实验滚动] 已重播：x={ax:.3f}, y={ay:.3f}, "
-                f"direction=down, distance_down={distance:g}"
-            )
+                if inp is not None:
+                    inp.scroll(-remain_units, x, y)
+                else:
+                    pyautogui.scroll(-remain_units)
+            log(C.SC001, x=ax, y=ay, down=distance)
             return True
         except Exception as exc:
-            print(f"\n[拉出新实验滚动] 重播失败：{exc}")
+            log(C.SC001, ok=0, err=exc)
             return False
 
     def deploy_experiment_with_retry(self, wait_start_sec=2.0):
@@ -800,12 +1129,16 @@ class GameActions:
         女进度条存在检查由上层（automation.py）负责。
         """
         ws = max(1.0, float(wait_start_sec))
-        print(f"\n[部署实验] 左键尝试部署，等待开始按钮（最长 {ws:.1f}s）...")
-        pyautogui.leftClick()
+        log(C.DP001, ws=ws, mode="start_only")
+        inp = self._inp()
+        if inp is not None:
+            inp.left_click()
+        else:
+            pyautogui.leftClick()
         if self.wait_start_button(timeout_sec=ws):
-            print("\n[部署实验] 成功：检测到开始按钮。")
+            log(C.DP002, mode="start_only")
             return True
-        print(f"\n[部署实验] 失败：{ws:.1f}s 内未出现开始按钮，切换下一个实验。")
+        log(C.DP003, reason="no_start_switch", ws=ws)
         return False
 
     def _click_with_interval(self, x, y, count, interval_sec):
@@ -813,14 +1146,21 @@ class GameActions:
         在固定坐标执行重复点击，并在两次点击之间保持给定间隔。
         该方法用于“点赞用户按钮”的节奏控制，避免点击过快导致漏触发。
         """
-        pyautogui.moveTo(x, y)
-        # 光标落点后稍等一拍，再点击，降低“移动与点击竞争”导致的漏点。
-        sleep(0.08)
-        for i in range(count):
-            pyautogui.leftClick()
-            # 末次点击后不需要再等待，避免引入额外尾部延迟。
-            if i < count - 1:
-                sleep(interval_sec)
+        inp = self._inp()
+        if inp is not None:
+            inp.move_to(x, y)
+            sleep(0.08)
+            for i in range(count):
+                inp.left_click()
+                if i < count - 1:
+                    sleep(interval_sec)
+        else:
+            pyautogui.moveTo(x, y)
+            sleep(0.08)
+            for i in range(count):
+                pyautogui.leftClick()
+                if i < count - 1:
+                    sleep(interval_sec)
 
     def give(self):
         points = self.config.get("like_points", [])
